@@ -332,6 +332,8 @@ class LarkHandler:
                 await self._cmd_desktop_attach(user_id, chat_id, args)
             else:
                 await self._cmd_desktop_list(user_id, chat_id)
+        elif command in ("/archived", "/desktop-archived"):
+            await self._cmd_desktop_archived(user_id, chat_id)
         elif command == "/desktop-detach":
             await self._cmd_desktop_detach(user_id, chat_id)
         elif command in ("/desktop-stop", "/stop"):
@@ -428,6 +430,7 @@ class LarkHandler:
         page: int = 0,
     ):
         """列出 Codex Desktop 最近任务并提供进入按钮。"""
+        await self._desktop.register_notification_target(user_id)
         if not await self._desktop.start():
             await card_service.send_text(
                 chat_id,
@@ -440,6 +443,17 @@ class LarkHandler:
             current_thread_id=self._desktop.binding_for(chat_id),
             page=page,
         )
+        await self._send_or_update_card(chat_id, card, message_id)
+
+    async def _cmd_desktop_archived(
+        self, user_id: str, chat_id: str, message_id: Optional[str] = None,
+        page: int = 0,
+    ):
+        """列出已归档的 Codex Desktop 任务。"""
+
+        await self._desktop.register_notification_target(user_id)
+        threads = await self._desktop.get_archived_threads()
+        card = build_desktop_list_card(threads, page=page, archived=True)
         await self._send_or_update_card(chat_id, card, message_id)
 
     async def _cmd_desktop_attach(
@@ -455,6 +469,14 @@ class LarkHandler:
             await self._cmd_desktop_list(user_id, chat_id, message_id=message_id)
             return
 
+        await self._desktop.register_notification_target(user_id)
+        if self._desktop.is_archived_thread(thread_id):
+            if not await self._desktop.unarchive_thread(thread_id):
+                await card_service.send_text(
+                    chat_id, "移出归档失败，请在 Codex Desktop 中检查该任务"
+                )
+                return
+
         had_cli_binding = chat_id in self._bridges or chat_id in self._chat_sessions
         ok = await self._desktop.attach(chat_id, user_id, thread_id)
         if not ok and sys.platform == "darwin":
@@ -466,8 +488,11 @@ class LarkHandler:
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    await asyncio.sleep(1.5)
-                    ok = await self._desktop.attach(chat_id, user_id, clean_id)
+                    for delay in (0.5, 1.0, 2.0):
+                        await asyncio.sleep(delay)
+                        ok = await self._desktop.attach(chat_id, user_id, clean_id)
+                        if ok:
+                            break
                 except Exception:
                     logger.debug("唤起 Desktop 任务后重试失败", exc_info=True)
         if ok and had_cli_binding:
@@ -477,6 +502,35 @@ class LarkHandler:
             await card_service.send_text(
                 chat_id,
                 "无法连接该 Desktop 任务。请确认任务正在本机 Desktop 中打开，或使用 /desktop 查看可用任务。",
+            )
+
+    async def _cmd_desktop_unarchive(
+        self,
+        user_id: str,
+        chat_id: str,
+        thread_id: str,
+        message_id: Optional[str] = None,
+        page: int = 0,
+    ):
+        """移出归档并原地刷新归档列表。"""
+
+        if not await self._desktop.unarchive_thread(thread_id):
+            await card_service.send_text(chat_id, "移出归档失败，请稍后重试")
+            return
+        await self._cmd_desktop_archived(
+            user_id, chat_id, message_id=message_id, page=page
+        )
+
+    async def handle_desktop_turn_page(
+        self, chat_id: str, expected_thread_id: str, target_turn_id: str
+    ):
+        """切换已连接 Desktop 卡片中显示的历史轮次。"""
+
+        if not await self._desktop.select_turn(
+            chat_id, expected_thread_id, target_turn_id
+        ):
+            await card_service.send_text(
+                chat_id, "该轮次已不可用，请使用 /desktop-status 刷新"
             )
 
     async def _cmd_desktop_detach(

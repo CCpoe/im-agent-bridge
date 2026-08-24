@@ -64,6 +64,12 @@ ChatGPT Desktop owner ── stdio App Server ── 目标 thread
 - `desktop_card.py` — conversationState/Immer patch 安全投影；只渲染公开消息和审批
 - `rich_text_renderer.py` — 持久化 pyte Screen 封装（server 端实时喂入）
 
+Desktop turn 历史翻页只是每个飞书 chat 的展示状态，不改写 thread；同一
+thread 绑定的多个 chat 可以查看不同 turn。任何消息或 pending input
+成功提交后，仅将当前 chat 立即切回最新 turn。查看历史 turn 时不展示
+当前 live turn 的 pending 审批/输入和停止按钮。rollout 基线在初始尾窗没有
+Query 时，会在有界字节窗口内反向找回最近用户轮的公开文本。
+
 **Server 端数据流（全量快照架构）：**
 ```
 PTY data → self._renderer.feed(data) → HistoryScreen(220×100, history=5000) 持久化实时更新

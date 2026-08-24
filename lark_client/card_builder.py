@@ -1157,6 +1157,7 @@ def build_help_card() -> Dict[str, Any]:
 **会话管理**
 • `/desktop` - 列出并连接 Codex Desktop 任务
 • `/desktop <thread-id 或 codex:// 链接>` - 连接指定 Desktop 任务
+• `/archived` - 查看并恢复已归档的 Desktop 任务
 • `/desktop-status` - 刷新 Desktop 状态卡片
 • `/desktop-stop` - 停止当前 Desktop turn
 • `/desktop-detach` - 断开 Desktop 任务（任务继续运行）

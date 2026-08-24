@@ -7,8 +7,10 @@ from lark_client.desktop_card import (
     PatchApplyError,
     apply_immer_patches,
     build_desktop_card,
+    build_desktop_completion_card,
     build_desktop_list_card,
     extract_public_events,
+    extract_public_turns,
     normalize_conversation_state,
     normalize_desktop_update,
     normalize_patch_only_update,
@@ -310,6 +312,50 @@ def test_desktop_card_has_send_stop_and_detach_controls():
     assert '"action": "desktop_detach"' in rendered
 
 
+def test_historical_turn_hides_live_pending_and_interrupt_controls():
+    snapshot = _snapshot()
+    snapshot["turns"].insert(0, {
+        "turnId": "turn-history",
+        "status": "completed",
+        "items": [
+            {
+                "id": "old-user",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "历史问题"}],
+            },
+            {
+                "id": "old-agent",
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "历史回答",
+            },
+        ],
+    })
+    snapshot["requests"] = [{
+        "id": "approval-live",
+        "method": "item/commandExecution/requestApproval",
+        "params": {"turnId": "turn-1", "reason": "当前轮待审批"},
+    }]
+    normalized = normalize_conversation_state(snapshot)
+
+    historical = json.dumps(
+        build_desktop_card(normalized, selected_turn_id="turn-history"),
+        ensure_ascii=False,
+    )
+    assert "历史问题" in historical
+    assert "等待审批" not in historical
+    assert "已完成" in historical
+    assert "当前轮待审批" not in historical
+    assert '"action": "desktop_approval"' not in historical
+    assert '"action": "desktop_interrupt"' not in historical
+    assert '"action": "desktop_detach"' in historical
+
+    latest = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert "当前轮待审批" in latest
+    assert '"action": "desktop_approval"' in latest
+    assert '"action": "desktop_interrupt"' in latest
+
+
 def test_desktop_list_card_uses_thread_ids_for_attach():
     card = build_desktop_list_card([
         {
@@ -415,6 +461,47 @@ def test_desktop_list_card_filters_invalid_rows_before_pagination():
     assert "Session ID：`valid-4`" in rendered
     assert "Session ID：`valid-5`" not in rendered
     assert "第 1/2 页 · 共 6 个" in rendered
+
+
+def test_archived_desktop_list_has_restore_and_attach_actions():
+    card = build_desktop_list_card([{
+        "thread_id": "archived-1",
+        "title": "已归档任务",
+        "project_name": "项目甲",
+        "status": "failed",
+    }], current_thread_id="archived-1", archived=True)
+    rendered = json.dumps(card, ensure_ascii=False)
+
+    assert "Codex Desktop 已归档" in rendered
+    assert "🔴 **项目甲**" in rendered
+    assert "Session：**已归档任务**" in rendered
+    assert '"action": "desktop_unarchive"' in rendered
+    assert '"action": "desktop_attach"' in rendered
+    assert "恢复并进入" in rendered
+    assert "移出归档" in rendered
+    assert '"action": "desktop_detach"' not in rendered
+
+
+@pytest.mark.parametrize(("outcome", "template", "label", "icon"), [
+    ("completed", "green", "执行完成", "🟢"),
+    ("failed", "red", "执行失败", "🔴"),
+])
+def test_desktop_completion_card_can_reconnect(outcome, template, label, icon):
+    card = build_desktop_completion_card({
+        "thread_id": "thread-1",
+        "title": "会话名称",
+        "project_name": "项目名称",
+        "outcome": outcome,
+        "completed_at": "2026-08-24T12:00:00Z",
+    })
+    rendered = json.dumps(card, ensure_ascii=False)
+
+    assert card["header"]["template"] == template
+    assert label in rendered
+    assert f"{icon} **项目名称**" in rendered
+    assert "Session：**会话名称**" in rendered
+    assert '"action": "desktop_attach"' in rendered
+    assert '"thread_id": "thread-1"' in rendered
 
 
 def test_bad_patch_and_revision_mismatch_fail_closed():
@@ -588,3 +675,363 @@ def test_snapshot_projection_indexes_existing_agent_for_later_text_delta():
     }))
     assert updated["messages"][-1]["text"] == "半截内容继续增长"
     assert "_conversation_state" not in updated
+
+
+def test_card_groups_public_content_by_turn_and_pages_with_stable_turn_ids():
+    snapshot = _snapshot()
+    snapshot["turns"] = [
+        {
+            "turnId": "turn-1",
+            "status": "completed",
+            "items": [
+                {
+                    "id": "user-1",
+                    "type": "userMessage",
+                    "content": [
+                        {"type": "text", "text": "第一轮问题"},
+                        {"type": "localImage", "path": "PRIVATE_IMAGE_PATH"},
+                    ],
+                },
+                {"id": "reason-1", "type": "reasoning", "text": "PRIVATE_REASONING"},
+                {
+                    "id": "agent-old",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "第一轮回答",
+                },
+            ],
+        },
+        {
+            "turnId": "turn-2",
+            "status": "inProgress",
+            "items": [
+                {
+                    "id": "user-2",
+                    "type": "userMessage",
+                    "content": [
+                        {"type": "text", "text": "第二轮问题"},
+                        {"type": "mention", "path": "PRIVATE_MENTION_PATH"},
+                    ],
+                },
+                {
+                    "id": "steer-2",
+                    "type": "steeringUserMessage",
+                    "input": [
+                        {"type": "text", "text": "再补充一个条件"},
+                        {"type": "audio", "url": "PRIVATE_AUDIO_URL"},
+                    ],
+                },
+                {
+                    "id": "tool-2",
+                    "type": "commandExecution",
+                    "aggregatedOutput": "PRIVATE_TOOL_OUTPUT",
+                },
+                {
+                    "id": "agent-new",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "第二轮处理中",
+                },
+            ],
+        },
+    ]
+
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    assert [turn["turn_id"] for turn in extract_public_turns(normalized)] == [
+        "turn-1",
+        "turn-2",
+    ]
+    assert [message["text"] for message in normalized["turns"][1]["user_messages"]] == [
+        "第二轮问题",
+        "再补充一个条件",
+    ]
+    # Keep the original flat field for existing bridge consumers.
+    assert [message["text"] for message in normalized["messages"]] == [
+        "第一轮回答",
+        "第二轮处理中",
+    ]
+
+    latest = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert "第二轮问题" in latest
+    assert "补充指令：再补充一个条件" in latest
+    assert "第二轮处理中" in latest
+    assert "第一轮问题" not in latest
+    assert "第一轮回答" not in latest
+    assert '"action": "desktop_turn_page"' in latest
+    assert '"target_turn_id": "turn-1"' in latest
+    assert "第 2/2 轮" in latest
+
+    older = json.dumps(
+        build_desktop_card(normalized, selected_turn_id="turn-1"),
+        ensure_ascii=False,
+    )
+    assert "第一轮问题" in older
+    assert "第一轮回答" in older
+    assert "第二轮问题" not in older
+    assert "第二轮处理中" not in older
+    assert '"target_turn_id": "turn-2"' in older
+    assert "第 1/2 轮" in older
+
+    for rendered in (latest, older):
+        assert "PRIVATE_IMAGE_PATH" not in rendered
+        assert "PRIVATE_MENTION_PATH" not in rendered
+        assert "PRIVATE_AUDIO_URL" not in rendered
+        assert "PRIVATE_REASONING" not in rendered
+        assert "PRIVATE_TOOL_OUTPUT" not in rendered
+
+
+def test_unknown_selected_turn_falls_back_to_latest_and_unknown_text_does_not_leak():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].insert(0, {
+        "id": "user-1",
+        "type": "userMessage",
+        "content": [
+            {"type": "unknown", "text": "PRIVATE_UNKNOWN_TEXT"},
+            {"type": "image", "url": "PRIVATE_IMAGE_URL"},
+        ],
+    })
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    rendered = json.dumps(
+        build_desktop_card(normalized, selected_turn_id="missing-turn"),
+        ensure_ascii=False,
+    )
+    assert "正在检查项目结构" in rendered
+    assert "该轮没有可显示的文本输入" in rendered
+    assert "PRIVATE_UNKNOWN_TEXT" not in rendered
+    assert "PRIVATE_IMAGE_URL" not in rendered
+
+
+def test_patch_only_whole_turn_and_text_delta_keep_query_and_agent_in_same_turn():
+    current = {
+        "schema_version": 1,
+        "schema_known": False,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 1,
+        "title": "Desktop task",
+        "status": "idle",
+        "active_turn_id": None,
+        "turns": [],
+        "messages": [],
+        "pending": None,
+    }
+    added = normalize_patch_only_update(current, _event({
+        "type": "patches",
+        "baseRevision": 1,
+        "revision": 2,
+        "patches": [{
+            "op": "add",
+            "path": ["turnHistory", "history", "entitiesByKey", "turn-2"],
+            "value": {
+                "turnId": "turn-2",
+                "status": "inProgress",
+                "items": [
+                    {
+                        "id": "user-2",
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "只处理这一轮"}],
+                    },
+                    {
+                        "id": "agent-2",
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "初始进度",
+                    },
+                    {"id": "secret", "type": "reasoning", "text": "PRIVATE_REASONING"},
+                ],
+            },
+        }],
+    }))
+    assert added["turns"][0]["turn_id"] == "turn-2"
+    assert added["turns"][0]["user_messages"][0]["text"] == "只处理这一轮"
+    assert added["messages"][0]["turn_id"] == "turn-2"
+
+    updated = normalize_patch_only_update(added, _event({
+        "type": "patches",
+        "baseRevision": 2,
+        "revision": 3,
+        "patches": [{
+            "op": "replace",
+            "path": [
+                "turnHistory", "history", "entitiesByKey", "turn-2",
+                "items", 1, "text",
+            ],
+            "value": "实时增长后的进度",
+        }],
+    }))
+    assert updated["turns"][0]["agent_messages"][0]["text"] == "实时增长后的进度"
+    assert updated["messages"][0]["text"] == "实时增长后的进度"
+    rendered = json.dumps(build_desktop_card(updated), ensure_ascii=False)
+    assert "只处理这一轮" in rendered
+    assert "实时增长后的进度" in rendered
+    assert "PRIVATE_REASONING" not in rendered
+
+
+def test_patch_only_item_uses_active_turn_when_turn_index_has_no_mapping():
+    current = {
+        "schema_version": 1,
+        "schema_known": False,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 7,
+        "title": "Desktop task",
+        "status": "running",
+        "active_turn_id": "turn-active",
+        "turns": [{
+            "turn_id": "turn-old",
+            "status": "completed",
+            "user_messages": [],
+            "agent_messages": [],
+        }],
+        "messages": [],
+        "pending": None,
+        "_patch_turn_ids": {},
+    }
+
+    updated = normalize_patch_only_update(current, _event({
+        "type": "patches",
+        "baseRevision": 7,
+        "revision": 8,
+        "patches": [{
+            "op": "add",
+            "path": ["turns", 0, "items", 0],
+            "value": {
+                "id": "agent-active",
+                "type": "agentMessage",
+                "phase": "commentary",
+                "text": "当前轮进度",
+            },
+        }],
+    }))
+
+    turns = {turn["turn_id"]: turn for turn in updated["turns"]}
+    assert turns["turn-old"]["agent_messages"] == []
+    assert turns["turn-active"]["agent_messages"][0]["text"] == "当前轮进度"
+    assert updated["messages"][0]["turn_id"] == "turn-active"
+
+
+def test_patch_only_add_turn_zero_appends_after_seeded_history_and_renders_latest():
+    current = {
+        "schema_version": 1,
+        "schema_known": False,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 10,
+        "title": "Desktop task",
+        "status": "completed",
+        "active_turn_id": None,
+        "turns": [{
+            "turn_id": "turn-history",
+            "status": "completed",
+            "user_messages": [{"id": "old-user", "kind": "initial", "text": "历史问题"}],
+            "agent_messages": [{
+                "id": "old-agent",
+                "turn_id": "turn-history",
+                "phase": "final_answer",
+                "text": "历史回答",
+            }],
+        }],
+        "messages": [],
+        "pending": None,
+        "_patch_turn_ids": {},
+    }
+
+    updated = normalize_patch_only_update(current, _event({
+        "type": "patches",
+        "baseRevision": 10,
+        "revision": 11,
+        "patches": [{
+            "op": "add",
+            "path": ["turns", 0],
+            "value": {
+                "turnId": "turn-active",
+                "status": "inProgress",
+                "items": [
+                    {
+                        "id": "new-user",
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "新一轮问题"}],
+                    },
+                    {
+                        "id": "new-agent",
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "新一轮处理中",
+                    },
+                ],
+            },
+        }],
+    }))
+
+    assert [turn["turn_id"] for turn in updated["turns"]] == [
+        "turn-history", "turn-active",
+    ]
+    assert updated["active_turn_id"] == "turn-active"
+    rendered = json.dumps(build_desktop_card(updated), ensure_ascii=False)
+    assert "新一轮问题" in rendered
+    assert "新一轮处理中" in rendered
+    assert "历史问题" not in rendered
+    assert "历史回答" not in rendered
+
+
+@pytest.mark.parametrize("history_first", [True, False])
+def test_patch_only_history_upsert_and_active_remove_keep_completed_turn(history_first):
+    current = {
+        "schema_version": 1,
+        "schema_known": False,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 20,
+        "title": "Desktop task",
+        "status": "running",
+        "active_turn_id": "turn-1",
+        "turns": [{
+            "turn_id": "turn-1",
+            "status": "running",
+            "user_messages": [{"id": "user-1", "kind": "initial", "text": "问题"}],
+            "agent_messages": [],
+        }],
+        "messages": [],
+        "pending": None,
+        "_patch_turn_ids": {'["turns",0]': "turn-1"},
+    }
+    history_patch = {
+        "op": "add",
+        "path": ["turnHistory", "history", "entitiesByKey", "turn-1"],
+        "value": {
+            "turnId": "turn-1",
+            "status": "completed",
+            "items": [
+                {
+                    "id": "user-1",
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "问题"}],
+                },
+                {
+                    "id": "final-1",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "最终回答",
+                },
+            ],
+        },
+    }
+    remove_active_patch = {"op": "remove", "path": ["turns", 0]}
+    patches = (
+        [history_patch, remove_active_patch]
+        if history_first else [remove_active_patch, history_patch]
+    )
+
+    updated = normalize_patch_only_update(current, _event({
+        "type": "patches",
+        "baseRevision": 20,
+        "revision": 21,
+        "patches": patches,
+    }))
+
+    assert len(updated["turns"]) == 1
+    assert updated["turns"][0]["turn_id"] == "turn-1"
+    assert updated["turns"][0]["status"] == "completed"
+    assert updated["turns"][0]["agent_messages"][0]["text"] == "最终回答"
+    assert updated["active_turn_id"] is None
+    assert updated["messages"][0]["text"] == "最终回答"

@@ -16,6 +16,10 @@ class FakeDesktop:
         self.detached = []
         self.stopped = []
         self.list_limits = []
+        self.notification_targets = []
+        self.archived = False
+        self.unarchived = []
+        self.turn_pages = []
 
     async def start(self):
         self.started = True
@@ -33,6 +37,25 @@ class FakeDesktop:
     def list_threads(self, limit=20):
         self.list_limits.append(limit)
         return [{"thread_id": "thread-1", "title": "Desktop task"}]
+
+    async def get_archived_threads(self):
+        return [{"thread_id": "archived-1", "title": "Archived task"}]
+
+    async def register_notification_target(self, user_id):
+        self.notification_targets.append(user_id)
+        return True
+
+    def is_archived_thread(self, thread_id):
+        return self.archived
+
+    async def unarchive_thread(self, thread_id):
+        self.unarchived.append(thread_id)
+        self.archived = False
+        return True
+
+    async def select_turn(self, chat_id, expected_thread_id, target_turn_id):
+        self.turn_pages.append((chat_id, expected_thread_id, target_turn_id))
+        return True
 
     async def send_message(self, chat_id, text, client_message_id=None):
         self.sent.append((chat_id, text, client_message_id))
@@ -112,11 +135,84 @@ async def test_desktop_list_passes_page_and_loads_enough_threads(monkeypatch):
     )
 
     assert desktop.list_limits == [None]
+    assert desktop.notification_targets == ["user-1"]
     handler._send_or_update_card.assert_awaited_once()
     chat_id, card, message_id = handler._send_or_update_card.await_args.args
     assert chat_id == "chat-1"
     assert message_id == "message-1"
     assert "第 1/1 页" in str(card)
+
+
+@pytest.mark.asyncio
+async def test_archived_list_and_unarchive_refresh_in_place():
+    desktop = FakeDesktop()
+    handler = make_handler(desktop)
+    handler._send_or_update_card = AsyncMock()
+
+    await handler._cmd_desktop_archived(
+        "user-1", "chat-1", message_id="message-1", page=2
+    )
+
+    assert desktop.notification_targets == ["user-1"]
+    chat_id, card, message_id = handler._send_or_update_card.await_args.args
+    assert (chat_id, message_id) == ("chat-1", "message-1")
+    assert "Codex Desktop 已归档" in str(card)
+
+    handler._cmd_desktop_archived = AsyncMock()
+    await handler._cmd_desktop_unarchive(
+        "user-1", "chat-1", "archived-1", message_id="message-1", page=2
+    )
+    assert desktop.unarchived == ["archived-1"]
+    handler._cmd_desktop_archived.assert_awaited_once_with(
+        "user-1", "chat-1", message_id="message-1", page=2
+    )
+
+
+@pytest.mark.asyncio
+async def test_archived_session_is_unarchived_before_attach(monkeypatch):
+    desktop = FakeDesktop()
+    desktop.archived = True
+    handler = make_handler(desktop)
+    monkeypatch.setattr(handler_module, "_track_stats", lambda *args, **kwargs: None)
+
+    await handler._cmd_desktop_attach("user-1", "chat-1", "archived-1")
+
+    assert desktop.unarchived == ["archived-1"]
+    assert desktop.attached_threads == [("chat-1", "user-1", "archived-1")]
+
+
+@pytest.mark.asyncio
+async def test_desktop_attach_retries_three_times_after_cold_start(monkeypatch):
+    desktop = FakeDesktop()
+    desktop.attach = AsyncMock(side_effect=[False, False, False, True])
+    handler = make_handler(desktop)
+    popen = MagicMock()
+    sleep = AsyncMock()
+    monkeypatch.setattr(handler_module.sys, "platform", "darwin")
+    monkeypatch.setattr(handler_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(handler_module.asyncio, "sleep", sleep)
+
+    await handler._cmd_desktop_attach("user-1", "chat-1", "thread-cold")
+
+    assert desktop.attach.await_count == 4
+    assert [call.args for call in desktop.attach.await_args_list] == [
+        ("chat-1", "user-1", "thread-cold"),
+        ("chat-1", "user-1", "thread-cold"),
+        ("chat-1", "user-1", "thread-cold"),
+        ("chat-1", "user-1", "thread-cold"),
+    ]
+    assert [call.args[0] for call in sleep.await_args_list] == [0.5, 1.0, 2.0]
+    popen.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_desktop_turn_page_routes_to_bound_thread():
+    desktop = FakeDesktop(attached=True)
+    handler = make_handler(desktop)
+
+    await handler.handle_desktop_turn_page("chat-1", "thread-1", "turn-old")
+
+    assert desktop.turn_pages == [("chat-1", "thread-1", "turn-old")]
 
 
 @pytest.mark.asyncio

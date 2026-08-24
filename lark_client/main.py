@@ -218,6 +218,31 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             ))
             return None
 
+        if action_type == "desktop_archived_list_page":
+            try:
+                page = int(action_value.get("page", 0))
+            except (TypeError, ValueError):
+                page = 0
+            print(f"[Lark] desktop_archived_list_page: page={page}")
+            asyncio.create_task(handler._cmd_desktop_archived(
+                user_id, chat_id, message_id=message_id, page=page
+            ))
+            return None
+
+        if action_type == "desktop_unarchive":
+            try:
+                page = int(action_value.get("page", 0))
+            except (TypeError, ValueError):
+                page = 0
+            asyncio.create_task(handler._cmd_desktop_unarchive(
+                user_id,
+                chat_id,
+                action_value.get("thread_id", ""),
+                message_id=message_id,
+                page=page,
+            ))
+            return None
+
         if action_type == "desktop_attach":
             thread_id = action_value.get("thread_id", "")
             asyncio.create_task(handler._cmd_desktop_attach(
@@ -237,6 +262,14 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
                 user_id, chat_id,
                 expected_thread_id=action_value.get("thread_id") or None,
                 expected_turn_id=action_value.get("turn_id"),
+            ))
+            return None
+
+        if action_type == "desktop_turn_page":
+            asyncio.create_task(handler.handle_desktop_turn_page(
+                chat_id,
+                action_value.get("thread_id", ""),
+                action_value.get("target_turn_id", ""),
             ))
             return None
 

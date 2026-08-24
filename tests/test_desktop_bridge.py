@@ -1,9 +1,12 @@
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+import lark_client.desktop_bridge as bridge_module
 from lark_client.desktop_bridge import DesktopBridgeManager
 from lark_client.desktop_ipc import DesktopIPCRemoteError
 
@@ -77,12 +80,32 @@ class FakeIPC:
             await result
 
 
+class FakeAppServer:
+    def __init__(self, archived_threads=None):
+        self.archived_threads = list(archived_threads or [])
+        self.list_calls = []
+        self.unarchived = []
+        self.closed = False
+
+    async def list_threads(self, archived, **kwargs):
+        self.list_calls.append((archived, kwargs))
+        return list(self.archived_threads) if archived else []
+
+    async def unarchive_thread(self, thread_id):
+        self.unarchived.append(thread_id)
+        return {"id": thread_id}
+
+    async def close(self):
+        self.closed = True
+
+
 class FakeCardService:
     def __init__(self):
         self.created = []
         self.sent = []
         self.updated = []
         self.active = {}
+        self.user_cards = []
 
     async def create_card(self, content):
         self.created.append(content)
@@ -91,6 +114,10 @@ class FakeCardService:
     async def send_card(self, chat_id, card_id):
         self.sent.append((chat_id, card_id))
         return "message-%d" % len(self.sent)
+
+    async def create_and_send_card_to_user(self, user_id, content, *, message_uuid=None):
+        self.user_cards.append((user_id, content, message_uuid))
+        return "notification-%d" % len(self.user_cards)
 
     async def update_card(self, card_id, sequence, content):
         self.updated.append((card_id, sequence, content))
@@ -143,13 +170,17 @@ def snapshot(status="inProgress", requests=None):
 
 
 def manager(tmp_path, ipc=None, cards=None, **kwargs):
+    kwargs.setdefault("app_server_client", FakeAppServer())
     return DesktopBridgeManager(
         cards or FakeCardService(),
         ipc or FakeIPC(),
         bindings_path=tmp_path / "bindings.json",
         session_index_path=tmp_path / "session_index.jsonl",
         sessions_dir=tmp_path / "sessions",
+        archived_sessions_dir=tmp_path / "archived_sessions",
+        state_db_path=tmp_path / "state.sqlite",
         global_state_path=tmp_path / "global-state.json",
+        notification_state_path=tmp_path / "notifications.json",
         reconnect_interval=0.01,
         card_update_interval=0,
         **kwargs,
@@ -302,7 +333,8 @@ def test_list_threads_merges_latest_index_with_safe_rollout_metadata(tmp_path):
         },
     }), encoding="utf-8")
 
-    threads = manager(tmp_path).list_threads()
+    bridge = manager(tmp_path)
+    threads = bridge.list_threads()
     assert threads == [{
         "id": "desktop-1",
         "thread_id": "desktop-1",
@@ -316,6 +348,11 @@ def test_list_threads_merges_latest_index_with_safe_rollout_metadata(tmp_path):
     serialized = json.dumps(threads)
     assert "ROLLOUT_PRIVATE_MUST_NOT_LEAK" not in serialized
     assert "PROJECT_PRIVATE_MUST_NOT_LEAK" not in serialized
+
+    internal = bridge.list_threads(None, include_internal=True)
+    assert internal[0]["_rollout_path"] == str(
+        rollout_dir / "rollout-test-desktop-1.jsonl"
+    )
 
 
 def test_project_name_fallbacks_are_safe_and_worktree_aware(tmp_path):
@@ -356,6 +393,201 @@ def test_bad_global_state_falls_back_to_repository_name(tmp_path):
     assert bridge._project_name_for_thread(
         "thread-1", None, "https://example.com/team/fallback.git", catalog
     ) == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_archived_threads_use_app_server_and_can_be_restored(tmp_path):
+    archived_dir = tmp_path / "archived_sessions"
+    archived_dir.mkdir()
+    rollout = archived_dir / "rollout-test-archived-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {
+            "id": "archived-1",
+            "cwd": "/workspace/archive",
+            "originator": "Codex Desktop",
+        },
+    }) + "\n", encoding="utf-8")
+    app_server = FakeAppServer([{
+        "id": "archived-1",
+        "name": "归档任务",
+        "cwd": "/workspace/archive",
+        "source": "vscode",
+        "path": str(rollout),
+        "updatedAt": 1787570000,
+        "threadSource": None,
+    }])
+    bridge = manager(tmp_path, app_server_client=app_server)
+
+    threads = await bridge.get_archived_threads()
+
+    assert threads[0]["thread_id"] == "archived-1"
+    assert threads[0]["title"] == "归档任务"
+    assert app_server.list_calls[0][0] is True
+    assert app_server.list_calls[0][1]["use_state_db_only"] is False
+    assert await bridge.unarchive_thread("archived-1")
+    assert app_server.unarchived == ["archived-1"]
+    await bridge.close()
+    assert app_server.closed
+
+
+@pytest.mark.asyncio
+async def test_archived_app_server_failure_bypasses_incomplete_state_db(tmp_path):
+    archived_dir = tmp_path / "archived_sessions"
+    archived_dir.mkdir()
+    rollout = archived_dir / "rollout-old-archived.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {
+            "id": "old-archived",
+            "cwd": "/workspace/legacy",
+            "originator": "Codex Desktop",
+        },
+    }) + "\n", encoding="utf-8")
+    (tmp_path / "session_index.jsonl").write_text(json.dumps({
+        "id": "old-archived",
+        "thread_name": "旧归档任务",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }) + "\n", encoding="utf-8")
+
+    # A valid but incomplete DB reproduces the compatibility case: the old
+    # archived rollout exists on disk but has not been migrated into threads.
+    connection = sqlite3.connect(tmp_path / "state.sqlite")
+    connection.execute("""
+        CREATE TABLE threads (
+            id TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT,
+            cwd TEXT, title TEXT, archived INTEGER, recency_at_ms INTEGER
+        )
+    """)
+    connection.commit()
+    connection.close()
+
+    app_server = FakeAppServer()
+    app_server.list_threads = AsyncMock(side_effect=RuntimeError("unavailable"))
+    bridge = manager(tmp_path, app_server_client=app_server)
+
+    threads = await bridge.get_archived_threads()
+
+    assert [thread["thread_id"] for thread in threads] == ["old-archived"]
+    assert threads[0]["title"] == "旧归档任务"
+    await bridge.close()
+
+
+def test_active_thread_list_excludes_archived_rollouts(tmp_path):
+    (tmp_path / "session_index.jsonl").write_text("\n".join([
+        json.dumps({"id": "active-1", "thread_name": "活跃", "updated_at": "2026-01-02Z"}),
+        json.dumps({"id": "archived-1", "thread_name": "归档", "updated_at": "2026-01-01Z"}),
+    ]) + "\n", encoding="utf-8")
+    active_dir = tmp_path / "sessions" / "2026" / "01" / "02"
+    active_dir.mkdir(parents=True)
+    (active_dir / "rollout-active-1.jsonl").write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "active-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+    archived_dir = tmp_path / "archived_sessions"
+    archived_dir.mkdir()
+    (archived_dir / "rollout-archived-1.jsonl").write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "archived-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+
+    assert [item["thread_id"] for item in manager(tmp_path).list_threads(None)] == [
+        "active-1"
+    ]
+
+
+def test_active_thread_list_excludes_archived_rows_in_state_db(tmp_path):
+    active_dir = tmp_path / "sessions"
+    archived_dir = tmp_path / "archived_sessions"
+    active_dir.mkdir()
+    archived_dir.mkdir()
+    active_rollout = active_dir / "rollout-active-1.jsonl"
+    archived_rollout = archived_dir / "rollout-archived-1.jsonl"
+    for path, thread_id in (
+        (active_rollout, "active-1"),
+        (archived_rollout, "archived-1"),
+    ):
+        path.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "originator": "Codex Desktop",
+            },
+        }) + "\n", encoding="utf-8")
+
+    connection = sqlite3.connect(tmp_path / "state.sqlite")
+    connection.execute("""
+        CREATE TABLE threads (
+            id TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT,
+            cwd TEXT, title TEXT, archived INTEGER, recency_at_ms INTEGER
+        )
+    """)
+    connection.executemany(
+        "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("active-1", str(active_rollout), 2, "vscode", "/active", "活跃", 0, 2),
+            ("archived-1", str(archived_rollout), 1, "vscode", "/old", "归档", 1, 1),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    bridge = manager(tmp_path)
+    assert [item["thread_id"] for item in bridge.list_threads(None)] == ["active-1"]
+    assert [item["thread_id"] for item in bridge.list_archived_threads(None)] == [
+        "archived-1"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unarchive_is_idempotent_under_concurrent_callbacks(tmp_path):
+    archived_dir = tmp_path / "archived_sessions"
+    archived_dir.mkdir()
+    rollout = archived_dir / "rollout-archived-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "archived-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowAppServer(FakeAppServer):
+        async def unarchive_thread(self, thread_id):
+            self.unarchived.append(thread_id)
+            rollout.unlink()
+            entered.set()
+            await release.wait()
+            return {"id": thread_id}
+
+    app_server = SlowAppServer()
+    bridge = manager(tmp_path, app_server_client=app_server)
+    first = asyncio.create_task(bridge.unarchive_thread("archived-1"))
+    await entered.wait()
+    second = asyncio.create_task(bridge.unarchive_thread("archived-1"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, True]
+    assert app_server.unarchived == ["archived-1"]
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_close_always_closes_app_server_when_ipc_disconnect_fails(tmp_path):
+    class BrokenDisconnectIPC(FakeIPC):
+        async def disconnect(self):
+            raise RuntimeError("disconnect failed")
+
+    app_server = FakeAppServer()
+    bridge = manager(
+        tmp_path,
+        ipc=BrokenDisconnectIPC(),
+        app_server_client=app_server,
+    )
+
+    with pytest.raises(RuntimeError, match="disconnect failed"):
+        await bridge.close()
+    assert app_server.closed
 
 
 def test_rollout_status_tracks_running_failure_and_recovery(tmp_path):
@@ -406,6 +638,98 @@ def test_rollout_status_tracks_running_failure_and_recovery(tmp_path):
     assert bridge._rollout_status(str(rollout)) == "idle"
 
 
+def test_rollout_seed_preserves_bounded_turn_queries_and_responses(tmp_path):
+    bridge = manager(tmp_path)
+    rollout_dir = tmp_path / "sessions" / "2026" / "01" / "03"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / "rollout-test-thread-1.jsonl"
+    rollout.write_text("\n".join([
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-1",
+        }}),
+        json.dumps({"type": "event_msg", "timestamp": "u-1", "payload": {
+            "type": "user_message", "message": "第一轮问题",
+        }}),
+        json.dumps({"type": "event_msg", "timestamp": "a-1", "payload": {
+            "type": "agent_message", "phase": "final_answer", "message": "第一轮回答",
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "turn-1",
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-2",
+        }}),
+        json.dumps({"type": "event_msg", "timestamp": "u-2", "payload": {
+            "type": "user_message", "message": "第二轮问题",
+        }}),
+        json.dumps({"type": "event_msg", "timestamp": "u-3", "payload": {
+            "type": "user_message", "message": "第二轮补充",
+        }}),
+        json.dumps({"type": "event_msg", "timestamp": "a-2", "payload": {
+            "type": "agent_message", "phase": "commentary", "message": "第二轮处理中",
+        }}),
+    ]) + "\n", encoding="utf-8")
+
+    state = bridge._seed_state_from_rollout("thread-1")
+
+    assert state["status"] == "running"
+    assert state["active_turn_id"] == "turn-2"
+    assert [turn["turn_id"] for turn in state["turns"]] == ["turn-1", "turn-2"]
+    assert state["turns"][0]["user_messages"][0]["text"] == "第一轮问题"
+    assert state["turns"][0]["agent_messages"][0]["text"] == "第一轮回答"
+    assert [message["kind"] for message in state["turns"][1]["user_messages"]] == [
+        "initial", "steering",
+    ]
+    assert state["turns"][1]["agent_messages"][0]["text"] == "第二轮处理中"
+
+
+def test_rollout_seed_recovers_latest_query_outside_initial_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "ROLLOUT_SEED_TAIL_BYTES", 512)
+    monkeypatch.setattr(bridge_module, "ROLLOUT_QUERY_SCAN_BYTES", 16 * 1024)
+    rollout_dir = tmp_path / "sessions" / "2026" / "01" / "03"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / "rollout-test-thread-1.jsonl"
+    records = [
+        {"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-source",
+        }},
+        {"type": "event_msg", "timestamp": "user-1", "payload": {
+            "type": "user_message", "message": "超出初始尾窗的 Query",
+        }},
+        {"type": "event_msg", "timestamp": "user-2", "payload": {
+            "type": "user_message", "message": "Query 的补充条件",
+        }},
+        {"type": "response_item", "payload": {
+            "type": "function_call_output", "output": "x" * 4096,
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "turn-source",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-active",
+        }},
+        {"type": "event_msg", "timestamp": "agent-live", "payload": {
+            "type": "agent_message", "phase": "commentary", "message": "当前轮进度",
+        }},
+    ]
+    rollout.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    bridge = manager(tmp_path)
+
+    state = bridge._seed_state_from_rollout("thread-1")
+
+    assert state["active_turn_id"] == "turn-active"
+    assert state["turns"][-1]["turn_id"] == "turn-active"
+    assert [message["text"] for message in state["turns"][-1]["user_messages"]] == [
+        "超出初始尾窗的 Query", "Query 的补充条件",
+    ]
+    assert [message["kind"] for message in state["turns"][-1]["user_messages"]] == [
+        "initial", "steering",
+    ]
+
+
 def test_live_desktop_state_takes_precedence_over_rollout_status(tmp_path):
     index = tmp_path / "session_index.jsonl"
     index.write_text(json.dumps({
@@ -429,6 +753,150 @@ def test_live_desktop_state_takes_precedence_over_rollout_status(tmp_path):
     bridge._states["desktop-1"] = {"status": "waiting_input"}
 
     assert bridge.list_threads()[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_turn_selection_is_per_chat_and_send_returns_to_latest(tmp_path):
+    ipc = FakeIPC()
+    cards = FakeCardService()
+    bridge = manager(tmp_path, ipc, cards)
+    bridge._bindings = {"chat-1": "thread-1", "chat-2": "thread-1"}
+    bridge._states["thread-1"] = {
+        "schema_version": 1,
+        "schema_known": True,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 2,
+        "title": "任务",
+        "status": "idle",
+        "active_turn_id": None,
+        "turns": [
+            {
+                "turn_id": "turn-1",
+                "status": "completed",
+                "user_messages": [{"id": "u1", "kind": "initial", "text": "旧问题"}],
+                "agent_messages": [{
+                    "id": "a1", "turn_id": "turn-1",
+                    "phase": "final_answer", "text": "旧回答",
+                }],
+            },
+            {
+                "turn_id": "turn-2",
+                "status": "completed",
+                "user_messages": [{"id": "u2", "kind": "initial", "text": "新问题"}],
+                "agent_messages": [{
+                    "id": "a2", "turn_id": "turn-2",
+                    "phase": "final_answer", "text": "新回答",
+                }],
+            },
+        ],
+        "messages": [],
+        "pending": None,
+    }
+
+    assert await bridge.select_turn("chat-1", "thread-1", "turn-1")
+    assert await bridge.select_turn("chat-2", "thread-1", "turn-1")
+    assert bridge._turn_views == {"chat-1": "turn-1", "chat-2": "turn-1"}
+    rendered = json.dumps(cards.created[-1], ensure_ascii=False)
+    assert "旧问题" in rendered and "新问题" not in rendered
+
+    assert await bridge.send_message("chat-1", "继续")
+    assert bridge._turn_views == {"chat-2": "turn-1"}
+    latest = json.dumps(cards.updated[-1][2], ensure_ascii=False)
+    assert "新问题" in latest and "旧问题" not in latest
+
+
+@pytest.mark.asyncio
+async def test_public_turn_only_change_updates_card(tmp_path):
+    cards = FakeCardService()
+    bridge = manager(tmp_path, cards=cards)
+    bridge._bindings = {"chat-1": "thread-1"}
+    bridge._states["thread-1"] = {
+        "schema_version": 1,
+        "schema_known": False,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 1,
+        "title": "任务",
+        "status": "idle",
+        "active_turn_id": None,
+        "turns": [],
+        "messages": [],
+        "pending": None,
+    }
+
+    await bridge._on_state_change({
+        "conversationId": "thread-1",
+        "hostId": "local",
+        "change": {
+            "type": "patches",
+            "baseRevision": 1,
+            "revision": 2,
+            "patches": [{
+                "op": "add",
+                "path": ["turnHistory", "history", "entitiesByKey", "turn-1"],
+                "value": {
+                    "turnId": "turn-1",
+                    "status": "unknown",
+                    "items": [{
+                        "id": "user-1",
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "只变更 turn"}],
+                    }],
+                },
+            }],
+        },
+    })
+
+    assert len(cards.created) == 1
+    rendered = json.dumps(cards.created[0], ensure_ascii=False)
+    assert "只变更 turn" in rendered
+
+
+@pytest.mark.asyncio
+async def test_pending_input_send_also_returns_card_to_latest_turn(tmp_path):
+    ipc = FakeIPC()
+    cards = FakeCardService()
+    bridge = manager(tmp_path, ipc, cards)
+    bridge._bindings = {"chat-1": "thread-1"}
+    bridge._turn_views = {"chat-1": "turn-1"}
+    bridge._states["thread-1"] = {
+        "schema_version": 1,
+        "schema_known": True,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 2,
+        "title": "任务",
+        "status": "waiting_input",
+        "active_turn_id": "turn-2",
+        "turns": [
+            {
+                "turn_id": "turn-1", "status": "completed",
+                "user_messages": [{"id": "u1", "kind": "initial", "text": "旧问题"}],
+                "agent_messages": [],
+            },
+            {
+                "turn_id": "turn-2", "status": "running",
+                "user_messages": [{"id": "u2", "kind": "initial", "text": "新问题"}],
+                "agent_messages": [],
+            },
+        ],
+        "messages": [],
+        "pending": {
+            "kind": "input",
+            "request_kind": "user_input",
+            "request_id": "request-1",
+            "question_id": "question-1",
+        },
+    }
+
+    assert await bridge.send_message("chat-1", "回答")
+    assert bridge._turn_views == {}
+    assert ("input", "thread-1", "request-1", {
+        "answers": {"question-1": {"answers": ["回答"]}},
+    }) in ipc.calls
+    rendered = json.dumps(cards.created[-1], ensure_ascii=False)
+    assert "新问题" in rendered and "旧问题" not in rendered
 
 
 @pytest.mark.asyncio

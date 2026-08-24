@@ -24,8 +24,10 @@ JSON = Union[None, bool, int, float, str, List["JSON"], Dict[str, "JSON"]]
 NORMALIZED_VERSION = 1
 MAX_PUBLIC_MESSAGES = 20
 MAX_PUBLIC_MESSAGE_CHARS = 4_000
+MAX_PUBLIC_TURNS = 20
 MAX_CARD_MESSAGES = 6
 MAX_CARD_MESSAGE_CHARS = 1_500
+MAX_CARD_QUERY_CHARS = 1_500
 DESKTOP_LIST_PAGE_SIZE = 5
 
 _PUBLIC_AGENT_PHASES = {None, "commentary", "final_answer"}
@@ -146,6 +148,7 @@ def _empty_state(
         "title": "Codex Desktop",
         "status": "unknown",
         "active_turn_id": None,
+        "turns": [],
         "messages": [],
         "pending": None,
     }
@@ -235,23 +238,206 @@ def _ordered_turns(state: Mapping[str, Any]) -> Optional[List[Mapping[str, Any]]
     return ordered
 
 
+def _public_text_content(value: Any, limit: int = MAX_PUBLIC_MESSAGE_CHARS) -> Optional[str]:
+    """Project text from a Desktop user-input content list.
+
+    Desktop content arrays can also contain images, audio, skills, mentions and
+    local paths.  Only exact ``text`` blocks are public here; all other block
+    types are deliberately ignored.
+    """
+    if not isinstance(value, list):
+        return None
+    parts: List[str] = []
+    for block in value:
+        if not isinstance(block, Mapping) or block.get("type") != "text":
+            continue
+        text = _clean_text(block.get("text"), limit)
+        if text:
+            parts.append(text)
+    return _clean_text("\n".join(parts), limit) if parts else None
+
+
+def _public_user_item(item: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(item, Mapping):
+        return None
+    item_type = item.get("type")
+    if item_type == "userMessage":
+        text = _public_text_content(item.get("content"))
+        kind = "initial"
+    elif item_type == "steeringUserMessage":
+        text = _public_text_content(item.get("input"))
+        kind = "steering"
+    else:
+        return None
+    if text is None:
+        return None
+    return {
+        "id": _identifier(item.get("id")) or "",
+        "kind": kind,
+        "text": text,
+    }
+
+
+def _public_agent_item(item: Any, turn_id: str = "") -> Optional[Dict[str, str]]:
+    if not isinstance(item, Mapping) or item.get("type") != "agentMessage":
+        return None
+    phase = item.get("phase")
+    text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
+    if phase not in _PUBLIC_AGENT_PHASES or text is None:
+        return None
+    return {
+        "id": _identifier(item.get("id")) or "",
+        "turn_id": turn_id,
+        "phase": phase or "final_answer",
+        "text": text,
+    }
+
+
+def _normalized_turn_status(value: Any) -> str:
+    return {
+        "active": "running",
+        "inProgress": "running",
+        "running": "running",
+        "idle": "idle",
+        "completed": "completed",
+        "failed": "failed",
+        "errored": "failed",
+        "systemError": "failed",
+        "interrupted": "interrupted",
+    }.get(value, "unknown")
+
+
+def _project_public_turn(turn: Any, fallback_id: str = "") -> Optional[Dict[str, Any]]:
+    if not isinstance(turn, Mapping) or not isinstance(turn.get("items"), list):
+        return None
+    turn_id = (
+        _identifier(turn.get("turnId"))
+        or _identifier(turn.get("id"))
+        or fallback_id
+    )
+    if not turn_id:
+        return None
+    user_messages: List[Dict[str, str]] = []
+    agent_messages: List[Dict[str, str]] = []
+    for item in turn["items"]:
+        user_message = _public_user_item(item)
+        if user_message is not None:
+            user_messages.append(user_message)
+            continue
+        agent_message = _public_agent_item(item, turn_id)
+        if agent_message is not None:
+            agent_messages.append(agent_message)
+    return {
+        "turn_id": turn_id,
+        "status": _normalized_turn_status(turn.get("status")),
+        "user_messages": user_messages,
+        "agent_messages": agent_messages[-MAX_PUBLIC_MESSAGES:],
+    }
+
+
+def _sanitize_public_turn(turn: Any) -> Optional[Dict[str, Any]]:
+    """Revalidate an already-normalized turn before rendering it."""
+    if not isinstance(turn, Mapping):
+        return None
+    turn_id = _identifier(turn.get("turn_id"))
+    if turn_id is None:
+        return None
+    user_messages: List[Dict[str, str]] = []
+    raw_users = turn.get("user_messages")
+    if isinstance(raw_users, list):
+        for message in raw_users:
+            if not isinstance(message, Mapping):
+                continue
+            text = _clean_text(message.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
+            kind = message.get("kind")
+            if text is None or kind not in {"initial", "steering"}:
+                continue
+            user_messages.append({
+                "id": _identifier(message.get("id")) or "",
+                "kind": kind,
+                "text": text,
+            })
+    agent_messages: List[Dict[str, str]] = []
+    raw_agents = turn.get("agent_messages")
+    if isinstance(raw_agents, list):
+        for message in raw_agents:
+            projected = _public_agent_item({
+                "id": message.get("id") if isinstance(message, Mapping) else None,
+                "type": "agentMessage",
+                "phase": message.get("phase") if isinstance(message, Mapping) else None,
+                "text": message.get("text") if isinstance(message, Mapping) else None,
+            }, turn_id)
+            if projected is not None:
+                agent_messages.append(projected)
+    status = turn.get("status")
+    if status not in _STATUS_LABELS:
+        status = "unknown"
+    return {
+        "turn_id": turn_id,
+        "status": status,
+        "user_messages": user_messages,
+        "agent_messages": agent_messages[-MAX_PUBLIC_MESSAGES:],
+    }
+
+
+def extract_public_turns(state: Any) -> List[Dict[str, Any]]:
+    """Return bounded, ordered turns containing only explicitly public fields."""
+    if isinstance(state, Mapping) and state.get("schema_version") == NORMALIZED_VERSION:
+        turns = state.get("turns")
+        if not isinstance(turns, list):
+            return []
+        result = [projected for turn in turns if (projected := _sanitize_public_turn(turn))]
+        return result[-MAX_PUBLIC_TURNS:]
+
+    raw = _unwrap_state(state)
+    if not isinstance(raw, Mapping):
+        return []
+    turns = _ordered_turns(raw)
+    if turns is None:
+        return []
+    result: List[Dict[str, Any]] = []
+    for turn in turns:
+        projected = _project_public_turn(turn)
+        if projected is None:
+            # Unknown turn structure fails closed instead of being recursively
+            # scraped for anything that merely looks like text.
+            return []
+        result.append(projected)
+    return result[-MAX_PUBLIC_TURNS:]
+
+
+def _safe_patch_item(item: Any, turn_id: str) -> Optional[Dict[str, Any]]:
+    agent = _public_agent_item(item, turn_id)
+    if agent is not None:
+        return dict(agent, type="agentMessage")
+    user = _public_user_item(item)
+    if user is not None:
+        item_type = item.get("type") if isinstance(item, Mapping) else None
+        return dict(user, type=item_type, turn_id=turn_id)
+    return None
+
+
 def _safe_patch_items_from_state(state: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
 
-    def add_items(prefix: List[Any], items: Any) -> None:
+    def add_items(prefix: List[Any], turn: Mapping[str, Any], fallback_id: str = "") -> None:
+        items = turn.get("items")
         if not isinstance(items, list):
             return
+        turn_id = (
+            _identifier(turn.get("turnId"))
+            or _identifier(turn.get("id"))
+            or fallback_id
+        )
+        if not turn_id:
+            return
         for index, item in enumerate(items):
-            if not isinstance(item, Mapping) or item.get("type") != "agentMessage":
+            projected = _safe_patch_item(item, turn_id)
+            if projected is None:
                 continue
             key = json.dumps(prefix + ["items", index], ensure_ascii=False, separators=(",", ":"))
-            result[key] = {
-                "id": item.get("id"),
-                "type": item.get("type"),
-                "phase": item.get("phase"),
-                "text": _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS),
-            }
-            while len(result) > 32:
+            result[key] = projected
+            while len(result) > 128:
                 result.pop(next(iter(result)))
 
     turn_history = state.get("turnHistory")
@@ -261,14 +447,41 @@ def _safe_patch_items_from_state(state: Mapping[str, Any]) -> Dict[str, Dict[str
         if isinstance(entities, Mapping):
             for key, turn in entities.items():
                 if isinstance(key, str) and isinstance(turn, Mapping):
-                    add_items(["turnHistory", "history", "entitiesByKey", key], turn.get("items"))
+                    add_items(["turnHistory", "history", "entitiesByKey", key], turn, key)
 
     # current turns last, so the bounded index always retains streaming item paths.
     turns = state.get("turns")
     if isinstance(turns, list):
         for index, turn in enumerate(turns):
             if isinstance(turn, Mapping):
-                add_items(["turns", index], turn.get("items"))
+                add_items(["turns", index], turn)
+    return result
+
+
+def _safe_patch_turn_ids_from_state(state: Mapping[str, Any]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    turn_history = state.get("turnHistory")
+    if isinstance(turn_history, Mapping):
+        history = turn_history.get("history")
+        entities = history.get("entitiesByKey") if isinstance(history, Mapping) else None
+        if isinstance(entities, Mapping):
+            for key, turn in entities.items():
+                if not isinstance(key, str) or not isinstance(turn, Mapping):
+                    continue
+                turn_id = _identifier(turn.get("turnId")) or _identifier(turn.get("id")) or key
+                result[json.dumps(
+                    ["turnHistory", "history", "entitiesByKey", key],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )] = turn_id
+    turns = state.get("turns")
+    if isinstance(turns, list):
+        for index, turn in enumerate(turns):
+            if not isinstance(turn, Mapping):
+                continue
+            turn_id = _identifier(turn.get("turnId")) or _identifier(turn.get("id"))
+            if turn_id:
+                result[json.dumps(["turns", index], separators=(",", ":"))] = turn_id
     return result
 
 
@@ -281,6 +494,13 @@ def extract_public_events(state: Any) -> List[Dict[str, Any]]:
     cannot accidentally surface reasoning or tool output.
     """
     if isinstance(state, Mapping) and state.get("schema_version") == NORMALIZED_VERSION:
+        turns = extract_public_turns(state)
+        if turns:
+            return [
+                message
+                for turn in turns
+                for message in turn["agent_messages"]
+            ][-MAX_PUBLIC_MESSAGES:]
         messages = state.get("messages")
         if not isinstance(messages, list):
             return []
@@ -300,41 +520,11 @@ def extract_public_events(state: Any) -> List[Dict[str, Any]]:
             })
         return result[-MAX_PUBLIC_MESSAGES:]
 
-    raw = _unwrap_state(state)
-    if not isinstance(raw, Mapping):
-        return []
-    turns = _ordered_turns(raw)
-    if turns is None:
-        return []
-
-    events: List[Dict[str, Any]] = []
-    seen: set = set()
-    for turn in turns:
-        items = turn.get("items")
-        if not isinstance(items, list):
-            return []
-        turn_id = _identifier(turn.get("turnId")) or _identifier(turn.get("id")) or ""
-        for item in items:
-            if not isinstance(item, Mapping) or item.get("type") != "agentMessage":
-                continue
-            phase = item.get("phase")
-            if phase not in _PUBLIC_AGENT_PHASES:
-                continue
-            text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
-            if text is None:
-                continue
-            item_id = _identifier(item.get("id")) or ""
-            marker = (turn_id, item_id, phase, text)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            events.append({
-                "id": item_id,
-                "turn_id": turn_id,
-                "phase": phase or "final_answer",
-                "text": text,
-            })
-    return events[-MAX_PUBLIC_MESSAGES:]
+    return [
+        message
+        for turn in extract_public_turns(state)
+        for message in turn["agent_messages"]
+    ][-MAX_PUBLIC_MESSAGES:]
 
 
 def _safe_options(value: Any) -> List[Dict[str, str]]:
@@ -506,7 +696,12 @@ def normalize_conversation_state(
             raw_state=raw if retain_raw else None,
         )
 
-    messages = extract_public_events(raw)
+    public_turns = extract_public_turns(raw)
+    messages = [
+        message
+        for turn in public_turns
+        for message in turn["agent_messages"]
+    ][-MAX_PUBLIC_MESSAGES:]
     pending = _pending_request(requests)
     title = _clean_text(raw.get("title"), 200) or _clean_text(raw.get("name"), 200)
     if title is None:
@@ -520,9 +715,11 @@ def normalize_conversation_state(
         "title": title,
         "status": _status_from_state(raw, turns, pending),
         "active_turn_id": None,
+        "turns": public_turns,
         "messages": messages,
         "pending": pending,
         "_patch_items": _safe_patch_items_from_state(raw),
+        "_patch_turn_ids": _safe_patch_turn_ids_from_state(raw),
     }
     if retain_raw:
         result["_conversation_state"] = copy.deepcopy(raw)
@@ -705,19 +902,133 @@ def normalize_desktop_update(
     return result
 
 
+def _turn_prefix(path: Sequence[Any]) -> Optional[List[Any]]:
+    if len(path) >= 2 and path[0] == "turns" and isinstance(path[1], int):
+        return list(path[:2])
+    if (
+        len(path) >= 4
+        and path[:3] == ["turnHistory", "history", "entitiesByKey"]
+        and isinstance(path[3], str)
+    ):
+        return list(path[:4])
+    return None
+
+
+def _turn_id_for_patch_path(
+    path: Sequence[Any], turn_ids: Mapping[str, str]
+) -> Optional[str]:
+    prefix = _turn_prefix(path)
+    if prefix is None:
+        return None
+    key = json.dumps(prefix, ensure_ascii=False, separators=(",", ":"))
+    known = _identifier(turn_ids.get(key))
+    if known:
+        return known
+    if len(prefix) == 4:
+        return _identifier(prefix[-1])
+    return None
+
+
+def _upsert_public_turn(
+    turns: List[Dict[str, Any]], turn: Mapping[str, Any], index: Optional[int] = None
+) -> None:
+    projected = _sanitize_public_turn(turn)
+    if projected is None:
+        return
+    for old_index, old in enumerate(turns):
+        if old.get("turn_id") == projected["turn_id"]:
+            turns[old_index] = projected
+            return
+    if index is not None and 0 <= index <= len(turns):
+        turns.insert(index, projected)
+    else:
+        turns.append(projected)
+    del turns[:-MAX_PUBLIC_TURNS]
+
+
+def _remove_public_item(turns: List[Dict[str, Any]], item: Any, fallback_id: str) -> None:
+    if not isinstance(item, Mapping):
+        return
+    turn_id = _identifier(item.get("turn_id"))
+    item_id = _identifier(item.get("id")) or fallback_id
+    item_type = item.get("type")
+    field = "agent_messages" if item_type == "agentMessage" else "user_messages"
+    for turn in turns:
+        if turn.get("turn_id") != turn_id:
+            continue
+        turn[field] = [
+            message
+            for message in turn.get(field, [])
+            if (_identifier(message.get("id")) or fallback_id) != item_id
+        ]
+
+
+def _upsert_public_item(
+    turns: List[Dict[str, Any]], item: Any, fallback_id: str
+) -> None:
+    if not isinstance(item, Mapping):
+        return
+    turn_id = _identifier(item.get("turn_id"))
+    if turn_id is None:
+        return
+    target = next((turn for turn in turns if turn.get("turn_id") == turn_id), None)
+    if target is None:
+        target = {
+            "turn_id": turn_id,
+            "status": "unknown",
+            "user_messages": [],
+            "agent_messages": [],
+        }
+        turns.append(target)
+        del turns[:-MAX_PUBLIC_TURNS]
+
+    item_id = _identifier(item.get("id")) or fallback_id
+    if item.get("type") == "agentMessage":
+        phase = item.get("phase")
+        text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
+        if phase not in _PUBLIC_AGENT_PHASES or text is None:
+            return
+        projected: Dict[str, str] = {
+            "id": item_id,
+            "turn_id": turn_id,
+            "phase": phase or "final_answer",
+            "text": text,
+        }
+        field = "agent_messages"
+    elif item.get("type") in {"userMessage", "steeringUserMessage"}:
+        text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
+        kind = item.get("kind")
+        if text is None or kind not in {"initial", "steering"}:
+            return
+        projected = {"id": item_id, "kind": kind, "text": text}
+        field = "user_messages"
+    else:
+        return
+
+    existing = target[field]
+    for index, message in enumerate(existing):
+        if (_identifier(message.get("id")) or fallback_id) == item_id:
+            existing[index] = projected
+            break
+    else:
+        existing.append(projected)
+    if field == "agent_messages":
+        del existing[:-MAX_PUBLIC_MESSAGES]
+
+
 def normalize_patch_only_update(
     current: Optional[Mapping[str, Any]],
     event: Any,
 ) -> Dict[str, Any]:
-    """Safely project useful v11 patches when an oversized snapshot is unavailable.
+    """Safely project useful v11 patches when a snapshot is unavailable.
 
-    Long Desktop conversations can exceed the IPC frame limit.  This fallback
-    never recursively scrapes values: it only accepts whole ``agentMessage``
-    items, known status leaves, and request objects under the top-level
-    ``requests`` collection.
+    The patch projection recognizes only public user/steering text, public
+    assistant messages, turn status leaves and top-level requests.  It never
+    recursively searches arbitrary payloads for displayable strings.
     """
     params = _event_params(event)
     current = current if isinstance(current, Mapping) else {}
+    current_turns = extract_public_turns(current)
     result: Dict[str, Any] = {
         "schema_version": NORMALIZED_VERSION,
         "schema_known": bool(current.get("schema_known")),
@@ -731,11 +1042,13 @@ def normalize_patch_only_update(
         "title": _clean_text(current.get("title"), 200) or "Codex Desktop",
         "status": current.get("status") if current.get("status") in _STATUS_LABELS else "unknown",
         "active_turn_id": current.get("active_turn_id"),
+        "turns": copy.deepcopy(current_turns),
         "messages": list(current.get("messages") or [])[-MAX_PUBLIC_MESSAGES:],
         "pending": current.get("pending") if isinstance(current.get("pending"), Mapping) else None,
         "needs_snapshot": True,
         "patch_only": True,
         "_patch_items": copy.deepcopy(current.get("_patch_items") or {}),
+        "_patch_turn_ids": copy.deepcopy(current.get("_patch_turn_ids") or {}),
     }
     if params is None or not isinstance(params.get("change"), Mapping):
         return result
@@ -747,8 +1060,9 @@ def normalize_patch_only_update(
     if not isinstance(patches, list):
         return result
 
-    messages = list(result["messages"])
+    turns = result["turns"]
     patch_items = result["_patch_items"]
+    patch_turn_ids = result["_patch_turn_ids"]
     for patch in patches:
         if not isinstance(patch, Mapping):
             continue
@@ -758,6 +1072,62 @@ def normalize_patch_only_update(
         if not isinstance(path, list) or op not in {"add", "replace", "remove"}:
             continue
 
+        prefix = _turn_prefix(path)
+        prefix_key = (
+            json.dumps(prefix, ensure_ascii=False, separators=(",", ":"))
+            if prefix is not None else None
+        )
+        is_whole_turn = prefix is not None and len(path) == len(prefix)
+        if is_whole_turn:
+            old_turn_id = _identifier(patch_turn_ids.get(prefix_key))
+            if op == "remove":
+                if old_turn_id:
+                    represented_elsewhere = any(
+                        key != prefix_key and _identifier(candidate) == old_turn_id
+                        for key, candidate in patch_turn_ids.items()
+                    )
+                    if not represented_elsewhere:
+                        turns[:] = [
+                            turn for turn in turns
+                            if turn.get("turn_id") != old_turn_id
+                        ]
+                    if (
+                        prefix
+                        and prefix[0] == "turns"
+                        and _identifier(result.get("active_turn_id")) == old_turn_id
+                    ):
+                        result["active_turn_id"] = None
+                if prefix_key:
+                    patch_turn_ids.pop(prefix_key, None)
+                    for key in list(patch_items):
+                        if key.startswith(prefix_key[:-1] + ","):
+                            patch_items.pop(key, None)
+            elif isinstance(value, Mapping):
+                fallback_id = (
+                    _identifier(prefix[-1]) if len(prefix) == 4 else ""
+                ) or ""
+                projected_turn = _project_public_turn(value, fallback_id)
+                if projected_turn is not None:
+                    # ``turns`` in the wire state is the current/active-turn
+                    # container, while our public list also contains historical
+                    # ``turnHistory`` entries.  Its index therefore cannot be
+                    # reused in the merged public list: add turns[0] must appear
+                    # after history so the default card renders the new turn.
+                    _upsert_public_turn(turns, projected_turn)
+                    if prefix_key:
+                        patch_turn_ids[prefix_key] = projected_turn["turn_id"]
+                    for item_index, item in enumerate(value.get("items") or []):
+                        item_key = json.dumps(
+                            prefix + ["items", item_index],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        projected_item = _safe_patch_item(item, projected_turn["turn_id"])
+                        if projected_item is not None:
+                            if not _identifier(projected_item.get("id")):
+                                projected_item["id"] = item_key
+                            patch_items[item_key] = projected_item
+
         item_key: Optional[str] = None
         item_offset: Optional[int] = None
         if "items" in path:
@@ -766,54 +1136,45 @@ def normalize_patch_only_update(
                 item_offset = item_index + 2
                 item_key = json.dumps(path[:item_offset], ensure_ascii=False, separators=(",", ":"))
 
-        if item_key is not None:
+        if item_key is not None and item_offset is not None:
             old_partial = patch_items.get(item_key)
-            old_message_id = (
-                _identifier(old_partial.get("id")) or item_key
-                if isinstance(old_partial, Mapping)
-                else None
-            )
+            _remove_public_item(turns, old_partial, item_key)
+            turn_id = _turn_id_for_patch_path(path, patch_turn_ids)
+            if turn_id is None and prefix and prefix[0] == "turns":
+                turn_id = _identifier(result.get("active_turn_id"))
             if op == "remove" and len(path) == item_offset:
                 patch_items.pop(item_key, None)
             elif op in {"add", "replace"} and len(path) == item_offset and isinstance(value, Mapping):
-                if value.get("type") == "agentMessage":
-                    patch_items[item_key] = {
-                        key: value.get(key)
-                        for key in ("id", "type", "phase", "text")
-                    }
+                projected_item = _safe_patch_item(value, turn_id or "")
+                if projected_item is not None:
+                    if not _identifier(projected_item.get("id")):
+                        projected_item["id"] = item_key
+                    patch_items[item_key] = projected_item
                 else:
                     patch_items.pop(item_key, None)
             elif item_key in patch_items and len(path) == item_offset + 1:
                 field = path[-1]
+                partial = patch_items[item_key]
                 if field in {"id", "type", "phase", "text"}:
                     if op == "remove":
-                        patch_items[item_key].pop(field, None)
+                        partial.pop(field, None)
                     else:
-                        patch_items[item_key][field] = value
-
-            if item_key not in patch_items or patch_items[item_key].get("type") != "agentMessage":
-                if old_message_id is not None:
-                    messages = [m for m in messages if m.get("id") != old_message_id]
+                        partial[field] = value
+                elif field in {"content", "input"}:
+                    text = None if op == "remove" else _public_text_content(value)
+                    if text is None:
+                        partial.pop("text", None)
+                    else:
+                        partial["text"] = text
+                if turn_id:
+                    partial["turn_id"] = turn_id
 
             partial = patch_items.get(item_key)
-            if isinstance(partial, Mapping) and partial.get("type") == "agentMessage":
-                phase = partial.get("phase")
-                text = _clean_text(partial.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
-                if phase in _PUBLIC_AGENT_PHASES and text:
-                    message_id = _identifier(partial.get("id")) or item_key
-                    message = {
-                        "id": message_id,
-                        "turn_id": "",
-                        "phase": phase or "final_answer",
-                        "text": text,
-                    }
-                    messages = [m for m in messages if m.get("id") != message_id]
-                    messages.append(message)
+            _upsert_public_item(turns, partial, item_key)
 
         if op in {"add", "replace"} and isinstance(value, Mapping):
             if path and path[0] == "requests":
                 result["pending"] = _pending_request([value])
-
         if path and path[0] == "requests" and op == "remove":
             result["pending"] = None
 
@@ -828,18 +1189,13 @@ def normalize_patch_only_update(
             and ("turns" in path or "turnHistory" in path or "threadRuntimeStatus" in path)
         )
         if is_thread_status_path and isinstance(status_value, str):
-            mapped = {
-                "active": "running",
-                "inProgress": "running",
-                "running": "running",
-                "idle": "idle",
-                "completed": "completed",
-                "failed": "failed",
-                "errored": "failed",
-                "interrupted": "interrupted",
-            }.get(status_value)
-            if mapped:
+            mapped = _normalized_turn_status(status_value)
+            if mapped != "unknown":
                 result["status"] = mapped
+                turn_id = _turn_id_for_patch_path(path, patch_turn_ids)
+                for turn in turns:
+                    if turn.get("turn_id") == turn_id:
+                        turn["status"] = mapped
                 if mapped != "running":
                     result["active_turn_id"] = None
 
@@ -857,7 +1213,24 @@ def normalize_patch_only_update(
                 or result.get("active_turn_id")
             )
 
-    result["messages"] = messages[-MAX_PUBLIC_MESSAGES:]
+    result["turns"] = turns[-MAX_PUBLIC_TURNS:]
+    represented_turns = {turn["turn_id"] for turn in result["turns"]}
+    legacy_messages = []
+    for message in result["messages"]:
+        if not isinstance(message, Mapping) or message.get("turn_id") in represented_turns:
+            continue
+        projected = _public_agent_item({
+            "id": message.get("id"),
+            "type": "agentMessage",
+            "phase": message.get("phase"),
+            "text": message.get("text"),
+        }, _identifier(message.get("turn_id")) or "")
+        if projected is not None:
+            legacy_messages.append(projected)
+    result["messages"] = (
+        legacy_messages
+        + [message for turn in result["turns"] for message in turn["agent_messages"]]
+    )[-MAX_PUBLIC_MESSAGES:]
     if isinstance(result.get("pending"), Mapping):
         result["status"] = (
             "waiting_input" if result["pending"].get("kind") == "input" else "waiting_approval"
@@ -885,7 +1258,9 @@ def _button_row(buttons: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def build_desktop_card(state: Any) -> Dict[str, Any]:
+def build_desktop_card(
+    state: Any, selected_turn_id: Optional[str] = None
+) -> Dict[str, Any]:
     """Build one updateable CardKit 2.0 card from normalized public state."""
     if not isinstance(state, Mapping) or state.get("schema_version") != NORMALIZED_VERSION:
         state = _empty_state()
@@ -893,22 +1268,133 @@ def build_desktop_card(state: Any) -> Dict[str, Any]:
     status = state.get("status") if state.get("status") in _STATUS_LABELS else "unknown"
     title = _clean_text(state.get("title"), 120) or "Codex Desktop"
     thread_id = _identifier(state.get("thread_id")) or ""
+    public_turns = extract_public_turns(state)
+    selected_index: Optional[int] = None
+    selected_turn: Optional[Dict[str, Any]] = None
+    if public_turns:
+        selected_index = len(public_turns) - 1
+        requested_turn_id = _identifier(selected_turn_id)
+        if requested_turn_id:
+            for index, turn in enumerate(public_turns):
+                if turn["turn_id"] == requested_turn_id:
+                    selected_index = index
+                    break
+        selected_turn = public_turns[selected_index]
+    viewing_latest_turn = (
+        selected_index is None or selected_index == len(public_turns) - 1
+    )
+    display_status = status
+    if not viewing_latest_turn and selected_turn is not None:
+        historical_status = selected_turn.get("status")
+        if historical_status in _STATUS_LABELS:
+            display_status = historical_status
     elements: List[Dict[str, Any]] = [
-        {"tag": "markdown", "content": "**{}**\n<font color='grey'>{}</font>".format(title, _STATUS_LABELS[status])}
+        {
+            "tag": "markdown",
+            "content": "**{}**\n<font color='grey'>{}</font>".format(
+                title, _STATUS_LABELS[display_status]
+            ),
+        }
     ]
 
-    messages = extract_public_events(state)
-    if messages:
+    if selected_turn is not None:
         elements.append({"tag": "hr"})
+        user_messages = selected_turn["user_messages"]
+        if user_messages:
+            query_parts: List[str] = []
+            for message in user_messages:
+                prefix = "补充指令：" if message["kind"] == "steering" else ""
+                query_parts.append(prefix + message["text"])
+            query = _clean_text("\n\n".join(query_parts), MAX_CARD_QUERY_CHARS) or ""
+            elements.append({
+                "tag": "markdown",
+                "content": "**用户 Query**\n{}".format(query),
+            })
+        else:
+            elements.append({
+                "tag": "markdown",
+                "content": "**用户 Query**\n<font color='grey'>该轮没有可显示的文本输入</font>",
+            })
+
+        messages = selected_turn["agent_messages"]
+        if messages:
+            elements.append({"tag": "hr"})
         for message in messages[-MAX_CARD_MESSAGES:]:
             label = "完成回复" if message["phase"] == "final_answer" else "进度"
             text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
             elements.append({"tag": "markdown", "content": "**{}**\n{}".format(label, text)})
+        if not messages:
+            elements.append({"tag": "markdown", "content": "等待该轮公开进度…"})
+
+        if len(public_turns) > 1 and selected_index is not None:
+            previous_button: Dict[str, Any] = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "← 前一轮"},
+                "type": "default",
+            }
+            next_button: Dict[str, Any] = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "后一轮 →"},
+                "type": "default",
+            }
+            if selected_index == 0:
+                previous_button["disabled"] = True
+            else:
+                previous_button["behaviors"] = [{
+                    "type": "callback",
+                    "value": {
+                        "action": "desktop_turn_page",
+                        "thread_id": thread_id,
+                        "target_turn_id": public_turns[selected_index - 1]["turn_id"],
+                    },
+                }]
+            if selected_index >= len(public_turns) - 1:
+                next_button["disabled"] = True
+            else:
+                next_button["behaviors"] = [{
+                    "type": "callback",
+                    "value": {
+                        "action": "desktop_turn_page",
+                        "thread_id": thread_id,
+                        "target_turn_id": public_turns[selected_index + 1]["turn_id"],
+                    },
+                }]
+            elements.extend([
+                {"tag": "hr"},
+                {
+                    "tag": "column_set",
+                    "flex_mode": "none",
+                    "horizontal_spacing": "small",
+                    "columns": [
+                        {"tag": "column", "width": "weighted", "weight": 1,
+                         "elements": [{"tag": "markdown", "content": " "}]},
+                        {"tag": "column", "width": "auto", "elements": [previous_button]},
+                        {"tag": "column", "width": "auto", "vertical_align": "center",
+                         "elements": [{"tag": "markdown", "content":
+                                       "第 {}/{} 轮".format(
+                                           selected_index + 1, len(public_turns)
+                                       )}]},
+                        {"tag": "column", "width": "auto", "elements": [next_button]},
+                        {"tag": "column", "width": "weighted", "weight": 1,
+                         "elements": [{"tag": "markdown", "content": " "}]},
+                    ],
+                },
+            ])
     else:
-        elements.append({"tag": "markdown", "content": "等待公开进度…"})
+        # Compatibility for rollout-derived or older normalized state that only
+        # has the original flat ``messages`` field.
+        messages = extract_public_events(state)
+        if messages:
+            elements.append({"tag": "hr"})
+            for message in messages[-MAX_CARD_MESSAGES:]:
+                label = "完成回复" if message["phase"] == "final_answer" else "进度"
+                text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
+                elements.append({"tag": "markdown", "content": "**{}**\n{}".format(label, text)})
+        else:
+            elements.append({"tag": "markdown", "content": "等待公开进度…"})
 
     pending = state.get("pending")
-    if isinstance(pending, Mapping):
+    if viewing_latest_turn and isinstance(pending, Mapping):
         request_id = _wire_identifier(pending.get("request_id"))
         kind = _identifier(pending.get("request_kind")) or "unknown"
         prompt = _clean_text(pending.get("prompt"), 600) or "需要处理"
@@ -971,7 +1457,8 @@ def build_desktop_card(state: Any) -> Dict[str, Any]:
             }),
         ]
         if (
-            status in {"running", "waiting_approval", "waiting_input"}
+            viewing_latest_turn
+            and status in {"running", "waiting_approval", "waiting_input"}
             and state.get("active_turn_id") is not None
         ):
             controls.insert(0, _button("停止", "danger", {
@@ -1006,9 +1493,9 @@ def build_desktop_card(state: Any) -> Dict[str, Any]:
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
-            "title": {"tag": "plain_text", "content": "Codex Desktop · {}".format(_STATUS_LABELS[status])},
+            "title": {"tag": "plain_text", "content": "Codex Desktop · {}".format(_STATUS_LABELS[display_status])},
             "subtitle": {"tag": "plain_text", "content": "实时同步"},
-            "template": _STATUS_TEMPLATES[status],
+            "template": _STATUS_TEMPLATES[display_status],
         },
         "body": {"elements": elements},
     }
@@ -1018,6 +1505,7 @@ def build_desktop_list_card(
     threads: Any,
     current_thread_id: Optional[str] = None,
     page: int = 0,
+    archived: bool = False,
 ) -> Dict[str, Any]:
     """Build a five-item, paginated picker for recent Desktop threads."""
     elements: List[Dict[str, Any]] = []
@@ -1059,9 +1547,26 @@ def build_desktop_list_card(
             details.append(f"目录：`{cwd}`")
         if updated_at:
             details.append(f"<font color='grey'>更新：{updated_at}</font>")
-        action = "desktop_detach" if is_current else "desktop_attach"
-        label = "断开" if is_current else "进入"
-        button_type = "danger" if is_current else "primary"
+        if archived:
+            buttons = [
+                _button("恢复并进入", "primary", {
+                    "action": "desktop_attach",
+                    "thread_id": thread_id,
+                }),
+                _button("移出归档", "default", {
+                    "action": "desktop_unarchive",
+                    "thread_id": thread_id,
+                    "page": page,
+                }),
+            ]
+        else:
+            action = "desktop_detach" if is_current else "desktop_attach"
+            label = "断开" if is_current else "进入"
+            button_type = "danger" if is_current else "primary"
+            buttons = [_button(label, button_type, {
+                "action": action,
+                "thread_id": thread_id,
+            })]
         elements.append({
             "tag": "column_set",
             "flex_mode": "none",
@@ -1075,10 +1580,7 @@ def build_desktop_list_card(
                 {
                     "tag": "column",
                     "width": "auto",
-                    "elements": [_button(label, button_type, {
-                        "action": action,
-                        "thread_id": thread_id,
-                    })],
+                    "elements": buttons,
                 },
             ],
         })
@@ -1103,14 +1605,24 @@ def build_desktop_list_card(
         else:
             previous_button["behaviors"] = [{
                 "type": "callback",
-                "value": {"action": "desktop_list_page", "page": page - 1},
+                "value": {
+                    "action": (
+                        "desktop_archived_list_page" if archived else "desktop_list_page"
+                    ),
+                    "page": page - 1,
+                },
             }]
         if page >= total_pages - 1:
             next_button["disabled"] = True
         else:
             next_button["behaviors"] = [{
                 "type": "callback",
-                "value": {"action": "desktop_list_page", "page": page + 1},
+                "value": {
+                    "action": (
+                        "desktop_archived_list_page" if archived else "desktop_list_page"
+                    ),
+                    "page": page + 1,
+                },
             }]
         elements.extend([
             {"tag": "hr"},
@@ -1135,10 +1647,55 @@ def build_desktop_list_card(
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
-            "title": {"tag": "plain_text", "content": "Codex Desktop 会话"},
+            "title": {"tag": "plain_text", "content":
+                      "Codex Desktop 已归档" if archived else "Codex Desktop 会话"},
             "subtitle": {"tag": "plain_text", "content":
                          f"选择任务 · 第 {page + 1}/{total_pages} 页 · 共 {total} 个"},
             "template": "blue",
+        },
+        "body": {"elements": elements},
+    }
+
+
+def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
+    """Build a standalone completion notification with a reconnect action."""
+
+    event = event if isinstance(event, Mapping) else {}
+    thread_id = _identifier(event.get("thread_id")) or ""
+    title = _clean_text(event.get("title"), 160) or "未命名任务"
+    project_name = _clean_text(event.get("project_name"), 120) or "未知项目"
+    outcome = "failed" if event.get("outcome") == "failed" else "completed"
+    failed = outcome == "failed"
+    status_text = "执行失败" if failed else "执行完成"
+    icon = "🔴" if failed else "🟢"
+    elements: List[Dict[str, Any]] = [{
+        "tag": "markdown",
+        "content": (
+            f"{icon} **{project_name}**\n"
+            f"Session：**{title}**\n"
+            f"Session ID：`{thread_id}`"
+        ),
+    }]
+    completed_at = _clean_text(event.get("completed_at"), 80)
+    if completed_at:
+        elements.append({
+            "tag": "markdown",
+            "content": f"<font color='grey'>时间：{completed_at}</font>",
+        })
+    if thread_id:
+        elements.append(_button_row([
+            _button("连接此 Session", "primary", {
+                "action": "desktop_attach",
+                "thread_id": thread_id,
+            }),
+        ]))
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"Codex Desktop · {status_text}"},
+            "subtitle": {"tag": "plain_text", "content": "任务完成提醒"},
+            "template": "red" if failed else "green",
         },
         "body": {"elements": elements},
     }
@@ -1148,8 +1705,10 @@ __all__ = [
     "PatchApplyError",
     "apply_immer_patches",
     "build_desktop_card",
+    "build_desktop_completion_card",
     "build_desktop_list_card",
     "extract_public_events",
+    "extract_public_turns",
     "normalize_conversation_state",
     "normalize_desktop_update",
     "normalize_patch_only_update",

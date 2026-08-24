@@ -12,21 +12,29 @@ import json
 import logging
 import mmap
 import os
+import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from .card_service import CardState
+from .codex_app_server import CodexAppServerClient
 from .desktop_card import (
     NORMALIZED_VERSION,
     build_desktop_card,
     normalize_conversation_state,
     normalize_patch_only_update,
 )
+from .desktop_notifications import DesktopCompletionMonitor
 from .desktop_ipc import DEFAULT_HOST_ID, DesktopIPCClient, DesktopIPCRemoteError
 
 
 logger = logging.getLogger("DesktopBridge")
+
+ROLLOUT_SEED_TAIL_BYTES = 8 * 1024 * 1024
+ROLLOUT_QUERY_SCAN_BYTES = 64 * 1024 * 1024
+ROLLOUT_QUERY_LINE_BYTES = 1024 * 1024
 
 class DesktopBridgeManager:
     """管理聊天与 Desktop 线程的绑定和实时卡片。"""
@@ -39,7 +47,12 @@ class DesktopBridgeManager:
         bindings_path: Optional[Path] = None,
         session_index_path: Optional[Path] = None,
         sessions_dir: Optional[Path] = None,
+        archived_sessions_dir: Optional[Path] = None,
+        state_db_path: Optional[Path] = None,
         global_state_path: Optional[Path] = None,
+        notification_state_path: Optional[Path] = None,
+        notification_poll_interval: float = 2.0,
+        app_server_client: Optional[Any] = None,
         reconnect_interval: float = 1.0,
         card_update_interval: float = 0.5,
     ) -> None:
@@ -53,28 +66,40 @@ class DesktopBridgeManager:
             session_index_path or Path.home() / ".codex" / "session_index.jsonl"
         )
         self.sessions_dir = Path(sessions_dir or Path.home() / ".codex" / "sessions")
+        self.archived_sessions_dir = Path(
+            archived_sessions_dir or Path.home() / ".codex" / "archived_sessions"
+        )
+        self.state_db_path = Path(state_db_path) if state_db_path else None
         self.global_state_path = Path(
             global_state_path or Path.home() / ".codex" / ".codex-global-state.json"
         )
+        self.app_server = app_server_client or CodexAppServerClient()
         self.reconnect_interval = max(0.05, reconnect_interval)
         self.card_update_interval = max(0.0, card_update_interval)
 
         self._bindings: Dict[str, str] = self._load_bindings()
         self._users: Dict[str, str] = {}
+        self._turn_views: Dict[str, Optional[str]] = {}
         self._states: Dict[str, Dict[str, Any]] = {}
         self._thread_metadata: Dict[str, Dict[str, Any]] = {}
         self._rollout_status_cache: Dict[str, tuple[int, int, str]] = {}
         self._chat_locks: Dict[str, asyncio.Lock] = {}
         self._operation_locks: Dict[str, asyncio.Lock] = {}
+        self._unarchive_locks: Dict[str, asyncio.Lock] = {}
         self._resolved_requests: Dict[tuple[str, str, str, str, str], float] = {}
         self._recent_messages: Dict[tuple[str, str], float] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_card_states: Dict[str, Mapping[str, Any]] = {}
         self._card_flush_tasks: Dict[str, asyncio.Task] = {}
-        self._monitor_task: Optional[asyncio.Task] = None
         self._start_lock: Optional[asyncio.Lock] = None
         self._started = False
         self._closed = False
+        self.notifications = DesktopCompletionMonitor(
+            card_service,
+            self._notification_sources,
+            state_path=notification_state_path,
+            poll_interval=notification_poll_interval,
+        )
 
     # -- 生命周期 ------------------------------------------------------
 
@@ -84,13 +109,14 @@ class DesktopBridgeManager:
 
     @property
     def has_bindings(self) -> bool:
-        return bool(self._bindings)
+        return bool(self._bindings) or self.notifications.has_targets
 
     async def start(self) -> bool:
         """连接 Desktop 并恢复所有持久化的跟随关系。"""
         if self._start_lock is None:
             self._start_lock = asyncio.Lock()
         async with self._start_lock:
+            self.notifications.start()
             if self._started and not self._closed:
                 return bool(self.ipc.connected)
             self._closed = False
@@ -114,11 +140,7 @@ class DesktopBridgeManager:
     async def close(self) -> None:
         self._closed = True
         self._started = False
-        monitor = self._monitor_task
-        self._monitor_task = None
-        if monitor is not None and monitor is not asyncio.current_task():
-            monitor.cancel()
-            await asyncio.gather(monitor, return_exceptions=True)
+        await self.notifications.close()
         background = [
             task for task in self._background_tasks
             if task is not asyncio.current_task()
@@ -136,7 +158,10 @@ class DesktopBridgeManager:
         self._card_flush_tasks.clear()
         self._pending_card_states.clear()
         self.ipc.remove_state_listener(self._on_state_change)
-        await self.ipc.disconnect()
+        try:
+            await self.ipc.disconnect()
+        finally:
+            await self.app_server.close()
 
     # -- 绑定 ----------------------------------------------------------
 
@@ -159,6 +184,7 @@ class DesktopBridgeManager:
 
         # follow 可能立即触发 snapshot，先建立内存绑定才能接住该事件。
         self._bindings[chat_id] = thread_id
+        self._turn_views.pop(chat_id, None)
         if user_id:
             self._users[chat_id] = str(user_id)
         state = self._states.get(thread_id) or self._seed_state_from_rollout(thread_id)
@@ -188,6 +214,7 @@ class DesktopBridgeManager:
         await self._cancel_card_flush(chat_id)
         thread_id = self._bindings.pop(chat_id, None)
         self._users.pop(chat_id, None)
+        self._turn_views.pop(chat_id, None)
         self._save_bindings()
         if thread_id and thread_id not in self._bindings.values():
             try:
@@ -214,13 +241,222 @@ class DesktopBridgeManager:
         state = self.state_for_chat(chat_id)
         return await self._publish_card(chat_id, state) if state is not None else False
 
+    async def register_notification_target(self, user_id: str) -> bool:
+        """Register a Lark user for Desktop turn completion notifications."""
+
+        registered = await self.notifications.register_target(user_id)
+        if registered:
+            self.notifications.start()
+        return registered
+
+    async def select_turn(
+        self, chat_id: str, expected_thread_id: str, target_turn_id: str
+    ) -> bool:
+        """Select one historical turn for a chat without changing thread state."""
+
+        thread_id = self._bindings.get(chat_id)
+        target_turn_id = str(target_turn_id or "").strip()
+        if thread_id != _clean_thread_id(expected_thread_id) or not target_turn_id:
+            return False
+        state = self._states.get(thread_id)
+        if not isinstance(state, Mapping):
+            return False
+        turns = state.get("turns")
+        if not isinstance(turns, list) or not any(
+            isinstance(turn, Mapping) and turn.get("turn_id") == target_turn_id
+            for turn in turns
+        ):
+            return False
+        self._turn_views[chat_id] = target_turn_id
+        return await self._publish_card(chat_id, state)
+
     # -- 线程发现 ------------------------------------------------------
 
-    def list_threads(self, limit: Optional[int] = 20) -> List[Dict[str, Any]]:
+    def list_threads(
+        self, limit: Optional[int] = 20, *, include_internal: bool = False
+    ) -> List[Dict[str, Any]]:
         """仅使用安全的索引和元数据字段返回最近的 Desktop 会话。"""
 
         if limit is not None and limit <= 0:
             return []
+        state_rows = self._state_db_threads(archived=False)
+        if state_rows is not None:
+            results = self._normalize_catalog_rows(
+                state_rows, archived=False, include_internal=include_internal
+            )
+            return results if limit is None else results[:limit]
+        indexed = self._read_session_index()
+        archived_ids = set(self._archived_rollout_metadata())
+
+        metadata = self._rollout_metadata(set(indexed))
+        project_catalog = self._load_project_catalog()
+        self._thread_metadata.update(metadata)
+        results: List[Dict[str, Any]] = []
+        for item in indexed.values():
+            if item["id"] in archived_ids:
+                continue
+            meta = metadata.get(item["id"])
+            if meta:
+                item.update(meta)
+            # 已确定不是 Desktop 创建的会话不会有 Desktop owner。
+            if (
+                item.get("originator") not in (None, "Codex Desktop")
+                or item.get("_is_child")
+            ):
+                continue
+            if not item.get("cwd"):
+                item["cwd"] = (
+                    project_catalog["workspace_hints"].get(item["id"])
+                    or project_catalog["projectless_output_dirs"].get(item["id"])
+                )
+            item["project_name"] = self._project_name_for_thread(
+                item["id"],
+                item.get("cwd"),
+                item.get("_git_repository_url"),
+                project_catalog,
+            )
+            live_state = self._states.get(item["id"])
+            live_status = (
+                live_state.get("status") if isinstance(live_state, Mapping) else None
+            )
+            item["status"] = _list_status(live_status)
+            if item["status"] == "idle" and live_status in (None, "unknown"):
+                item["status"] = self._rollout_status(item.get("_rollout_path"))
+            item.pop("_git_repository_url", None)
+            item.pop("_is_child", None)
+            if not include_internal:
+                item.pop("_rollout_path", None)
+            results.append(item)
+        results.sort(
+            key=lambda item: (item.get("_activity_mtime", 0), item["updated_at"]),
+            reverse=True,
+        )
+        for item in results:
+            item.pop("_activity_mtime", None)
+            if not include_internal:
+                item.pop("_rollout_path", None)
+        return results if limit is None else results[:limit]
+
+    def list_archived_threads(
+        self, limit: Optional[int] = 20, *, include_internal: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Return archived top-level Desktop sessions for the Lark picker."""
+
+        if limit is not None and limit <= 0:
+            return []
+        state_rows = self._state_db_threads(archived=True)
+        if state_rows is not None:
+            results = self._normalize_catalog_rows(
+                state_rows, archived=True, include_internal=include_internal
+            )
+            return results if limit is None else results[:limit]
+        return self._list_archived_threads_from_filesystem(
+            limit, include_internal=include_internal
+        )
+
+    def _list_archived_threads_from_filesystem(
+        self, limit: Optional[int] = 20, *, include_internal: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Scan archived rollouts without consulting the optional state DB."""
+
+        if limit is not None and limit <= 0:
+            return []
+        indexed = self._read_session_index()
+        metadata = self._archived_rollout_metadata()
+        project_catalog = self._load_project_catalog()
+        results: List[Dict[str, Any]] = []
+        for thread_id, meta in metadata.items():
+            if meta.get("originator") != "Codex Desktop" or meta.get("_is_child"):
+                continue
+            indexed_item = indexed.get(thread_id) or {}
+            cwd = meta.get("cwd") or indexed_item.get("cwd")
+            updated_at = indexed_item.get("updated_at")
+            if not isinstance(updated_at, str) or not updated_at:
+                updated_at = _iso_timestamp(meta.get("_activity_mtime"))
+            item = {
+                "id": thread_id,
+                "thread_id": thread_id,
+                "title": _safe_title(indexed_item.get("title")),
+                "updated_at": updated_at,
+                "cwd": cwd if isinstance(cwd, str) else None,
+                "originator": "Codex Desktop",
+                "project_name": self._project_name_for_thread(
+                    thread_id,
+                    cwd,
+                    meta.get("_git_repository_url"),
+                    project_catalog,
+                ),
+                "status": self._rollout_status(meta.get("_rollout_path")),
+                "_activity_mtime": meta.get("_activity_mtime", 0),
+                "_rollout_path": meta.get("_rollout_path"),
+            }
+            results.append(item)
+        results.sort(
+            key=lambda item: (item.get("_activity_mtime", 0), item["updated_at"]),
+            reverse=True,
+        )
+        for item in results:
+            item.pop("_activity_mtime", None)
+            if not include_internal:
+                item.pop("_rollout_path", None)
+        return results if limit is None else results[:limit]
+
+    async def get_archived_threads(self) -> List[Dict[str, Any]]:
+        """Use the official App Server list API, with a filesystem fallback."""
+
+        try:
+            raw_threads = await self.app_server.list_threads(
+                True,
+                source_kinds=["vscode", "exec", "appServer"],
+                # Let App Server scan archived rollouts and repair missing
+                # metadata.  State-DB-only mode can silently omit sessions
+                # created by or migrated from older Codex versions.
+                use_state_db_only=False,
+            )
+            return await asyncio.to_thread(
+                self._normalize_app_server_threads, raw_threads, True
+            )
+        except Exception:
+            logger.exception("Codex App Server 归档列表失败，使用本地索引回退")
+            # Do not route through list_archived_threads here: a present but
+            # incomplete state DB is one reason App Server may have failed to
+            # provide the old archived rollouts in the first place.
+            return await asyncio.to_thread(
+                self._list_archived_threads_from_filesystem, None
+            )
+
+    def is_archived_thread(self, thread_id: str) -> bool:
+        return _clean_thread_id(thread_id) in self._archived_rollout_metadata()
+
+    async def unarchive_thread(self, thread_id: str) -> bool:
+        thread_id = _clean_thread_id(thread_id)
+        if not thread_id:
+            return False
+        lock = self._unarchive_locks.setdefault(thread_id, asyncio.Lock())
+        async with lock:
+            # Recheck after acquiring the per-thread lock.  Feishu can deliver
+            # the same card callback more than once, and a second click should
+            # observe the first successful restore rather than report failure.
+            if not self.is_archived_thread(thread_id):
+                return True
+            try:
+                await self.app_server.unarchive_thread(thread_id)
+            except Exception:
+                # A concurrent Desktop action can win outside this process.
+                # Treat the desired final state as success when the archived
+                # rollout disappeared before App Server returned its error.
+                if not self.is_archived_thread(thread_id):
+                    return True
+                logger.exception("无法移出归档 Desktop 线程 %s", thread_id)
+                return False
+            old = self._thread_metadata.pop(thread_id, None)
+            if isinstance(old, Mapping):
+                old_path = old.get("_rollout_path")
+                if isinstance(old_path, str):
+                    self._rollout_status_cache.pop(old_path, None)
+            return True
+
+    def _read_session_index(self) -> Dict[str, Dict[str, Any]]:
         indexed: Dict[str, Dict[str, Any]] = {}
         try:
             with self.session_index_path.open("r", encoding="utf-8") as source:
@@ -246,47 +482,8 @@ class DesktopBridgeManager:
                             "originator": None,
                         }
         except OSError:
-            return []
-
-        metadata = self._rollout_metadata(set(indexed))
-        project_catalog = self._load_project_catalog()
-        self._thread_metadata.update(metadata)
-        results: List[Dict[str, Any]] = []
-        for item in indexed.values():
-            meta = metadata.get(item["id"])
-            if meta:
-                item.update(meta)
-            # 已确定不是 Desktop 创建的会话不会有 Desktop owner。
-            if item.get("originator") not in (None, "Codex Desktop"):
-                continue
-            if not item.get("cwd"):
-                item["cwd"] = (
-                    project_catalog["workspace_hints"].get(item["id"])
-                    or project_catalog["projectless_output_dirs"].get(item["id"])
-                )
-            item["project_name"] = self._project_name_for_thread(
-                item["id"],
-                item.get("cwd"),
-                item.get("_git_repository_url"),
-                project_catalog,
-            )
-            live_state = self._states.get(item["id"])
-            live_status = (
-                live_state.get("status") if isinstance(live_state, Mapping) else None
-            )
-            item["status"] = _list_status(live_status)
-            if item["status"] == "idle" and live_status in (None, "unknown"):
-                item["status"] = self._rollout_status(item.get("_rollout_path"))
-            item.pop("_git_repository_url", None)
-            item.pop("_rollout_path", None)
-            results.append(item)
-        results.sort(
-            key=lambda item: (item.get("_activity_mtime", 0), item["updated_at"]),
-            reverse=True,
-        )
-        for item in results:
-            item.pop("_activity_mtime", None)
-        return results if limit is None else results[:limit]
+            return {}
+        return indexed
 
     def _rollout_metadata(self, wanted: set[str]) -> Dict[str, Dict[str, Any]]:
         found: Dict[str, Dict[str, Any]] = {
@@ -336,6 +533,7 @@ class DesktopBridgeManager:
                     found[thread_id] = {
                         "cwd": cwd if isinstance(cwd, str) else None,
                         "originator": originator if isinstance(originator, str) else None,
+                        "_is_child": bool(payload.get("parent_thread_id")),
                         "_git_repository_url": (
                             repository_url if isinstance(repository_url, str) else None
                         ),
@@ -351,6 +549,152 @@ class DesktopBridgeManager:
             value.pop("_timestamp", None)
         self._thread_metadata.update(found)
         return found
+
+    def _archived_rollout_metadata(self) -> Dict[str, Dict[str, Any]]:
+        found: Dict[str, Dict[str, Any]] = {}
+        if not self.archived_sessions_dir.exists():
+            return found
+        try:
+            paths = self.archived_sessions_dir.glob("**/rollout-*.jsonl")
+            for path in paths:
+                metadata = _read_rollout_metadata_file(path)
+                thread_id = _clean_thread_id(metadata.get("thread_id"))
+                if not thread_id:
+                    continue
+                previous = found.get(thread_id)
+                modified = path.stat().st_mtime
+                if previous and modified <= previous.get("_activity_mtime", 0):
+                    continue
+                metadata["_activity_mtime"] = modified
+                metadata["_rollout_path"] = str(path)
+                found[thread_id] = metadata
+        except OSError:
+            return found
+        return found
+
+    def _normalize_app_server_threads(
+        self, raw_threads: Any, archived: bool, include_internal: bool = False
+    ) -> List[Dict[str, Any]]:
+        return self._normalize_catalog_rows(
+            raw_threads, archived=archived, include_internal=include_internal
+        )
+
+    def _state_db_threads(self, *, archived: bool) -> Optional[List[Dict[str, Any]]]:
+        path = self.state_db_path
+        if path is None:
+            candidates = sorted(
+                self.session_index_path.parent.glob("state_*.sqlite"),
+                key=lambda candidate: candidate.stat().st_mtime,
+                reverse=True,
+            )
+            path = candidates[0] if candidates else None
+        if path is None or not path.is_file():
+            return None
+        try:
+            uri = "file:{}?mode=ro".format(str(path).replace("?", "%3F"))
+            connection = sqlite3.connect(uri, uri=True, timeout=1.0)
+            try:
+                connection.execute("PRAGMA query_only = ON")
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(threads)")
+                }
+                required = {
+                    "id", "rollout_path", "updated_at", "source", "cwd", "title", "archived"
+                }
+                if not required.issubset(columns):
+                    return None
+                name_expr = "name" if "name" in columns else "NULL"
+                updated_ms_expr = "updated_at_ms" if "updated_at_ms" in columns else "NULL"
+                recency_expr = "recency_at_ms" if "recency_at_ms" in columns else "updated_at"
+                thread_source_expr = "thread_source" if "thread_source" in columns else "NULL"
+                git_origin_expr = "git_origin_url" if "git_origin_url" in columns else "NULL"
+                query = f"""
+                    SELECT id, rollout_path, title, cwd, source, updated_at,
+                           {updated_ms_expr}, {thread_source_expr}, {git_origin_expr},
+                           {name_expr}
+                    FROM threads
+                    WHERE archived = ?
+                    ORDER BY {recency_expr} DESC, id DESC
+                """
+                rows = connection.execute(query, (1 if archived else 0,)).fetchall()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error):
+            logger.debug("无法读取 Codex state 数据库", exc_info=True)
+            return None
+        names = [
+            "id", "path", "title", "cwd", "source", "updatedAt",
+            "updatedAtMs", "threadSource", "gitOriginUrl", "name",
+        ]
+        return [dict(zip(names, row)) for row in rows]
+
+    def _normalize_catalog_rows(
+        self, rows: Any, *, archived: bool, include_internal: bool
+    ) -> List[Dict[str, Any]]:
+        project_catalog = self._load_project_catalog()
+        results: List[Dict[str, Any]] = []
+        if not isinstance(rows, list):
+            return results
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            thread_id = _clean_thread_id(raw.get("id"))
+            if (
+                not thread_id
+                or raw.get("threadSource") == "subagent"
+                or raw.get("parentThreadId")
+            ):
+                continue
+            path = _path_value(raw.get("path"))
+            metadata = _read_rollout_metadata_file(path) if path is not None else {}
+            if metadata.get("_is_child"):
+                continue
+            originator = metadata.get("originator")
+            source = raw.get("source")
+            if originator not in (None, "Codex Desktop"):
+                continue
+            if originator is None and source != "vscode":
+                continue
+            cwd = raw.get("cwd") if isinstance(raw.get("cwd"), str) else metadata.get("cwd")
+            repository_url = raw.get("gitOriginUrl") or metadata.get("_git_repository_url")
+            live_state = self._states.get(thread_id)
+            live_status = (
+                live_state.get("status") if isinstance(live_state, Mapping) else None
+            )
+            status = _list_status(live_status)
+            if status == "idle" and live_status in (None, "unknown"):
+                status = self._rollout_status(str(path) if path is not None else None)
+            updated_at = _iso_timestamp(raw.get("updatedAtMs") or raw.get("updatedAt"))
+            item = {
+                "id": thread_id,
+                "thread_id": thread_id,
+                "title": _safe_title(raw.get("name") or raw.get("title")),
+                "updated_at": updated_at,
+                "cwd": cwd if isinstance(cwd, str) else None,
+                "originator": originator or "Codex Desktop",
+                "project_name": self._project_name_for_thread(
+                    thread_id, cwd, repository_url, project_catalog
+                ),
+                "status": "idle" if archived and status == "running" else status,
+                "_rollout_path": str(path) if path is not None else None,
+            }
+            results.append(item)
+            self._thread_metadata[thread_id] = {
+                "cwd": item["cwd"],
+                "originator": item["originator"],
+                "_git_repository_url": repository_url,
+                "_rollout_path": item["_rollout_path"],
+            }
+        if not include_internal:
+            for item in results:
+                item.pop("_rollout_path", None)
+        return results
+
+    def _notification_sources(self) -> List[Mapping[str, Any]]:
+        return [
+            *self.list_threads(None, include_internal=True),
+            *self.list_archived_threads(None, include_internal=True),
+        ]
 
     def _rollout_status(self, raw_path: Any) -> str:
         """Return the last persisted turn status without parsing whole rollouts."""
@@ -555,6 +899,8 @@ class DesktopBridgeManager:
                     )
                     if not accepted:
                         self._recent_messages.pop(message_key, None)
+                    else:
+                        await self._return_to_latest_turn(chat_id, thread_id)
                     return accepted
                 try:
                     await self.ipc.steer_turn(
@@ -569,11 +915,26 @@ class DesktopBridgeManager:
                         text,
                         client_user_message_id=client_message_id,
                     )
+                await self._return_to_latest_turn(chat_id, thread_id)
                 return True
             except Exception:
                 self._recent_messages.pop(message_key, None)
                 logger.exception("无法向 Desktop 线程 %s 发送消息", thread_id)
                 return False
+
+    async def _return_to_latest_turn(self, chat_id: str, thread_id: str) -> None:
+        """成功发送后让当前聊天回到最新一轮，不影响同线程的其他聊天。"""
+
+        if self._turn_views.pop(chat_id, None) is None:
+            return
+        state = self._states.get(thread_id)
+        if self._bindings.get(chat_id) != thread_id or not isinstance(state, Mapping):
+            return
+        try:
+            await self._publish_card(chat_id, state)
+        except Exception:
+            # 消息已经提交给 Desktop，卡片刷新失败不应被误报为发送失败。
+            logger.exception("发送后无法将 Desktop 卡片切回最新轮")
 
     async def interrupt(self, chat_id: str, expected_turn_id: Any = None) -> bool:
         thread_id = self._bindings.get(chat_id)
@@ -766,7 +1127,9 @@ class DesktopBridgeManager:
     ) -> bool:
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
-            content = build_desktop_card(state)
+            content = build_desktop_card(
+                state, selected_turn_id=self._turn_views.get(chat_id)
+            )
             active = None if replace else self.card_service.get_active_card(chat_id)
             if active is not None:
                 active.sequence += 1
@@ -844,12 +1207,14 @@ class DesktopBridgeManager:
             return state
 
         messages: List[Dict[str, Any]] = []
+        turns: List[Dict[str, Any]] = []
+        current_turn: Optional[Dict[str, Any]] = None
         status = "unknown"
         active_turn_id: Any = None
         try:
             with matches[0].open("rb") as source:
                 size = source.seek(0, os.SEEK_END)
-                source.seek(max(0, size - 8 * 1024 * 1024))
+                source.seek(max(0, size - ROLLOUT_SEED_TAIL_BYTES))
                 if source.tell() > 0:
                     source.readline()
                 for raw_line in source:
@@ -864,24 +1229,84 @@ class DesktopBridgeManager:
                     if event_type == "task_started":
                         status = "running"
                         active_turn_id = payload.get("turn_id")
+                        turn_id = str(active_turn_id or record.get("timestamp") or "")
+                        current_turn = {
+                            "turn_id": turn_id,
+                            "status": "running",
+                            "user_messages": [],
+                            "agent_messages": [],
+                        }
+                        turns.append(current_turn)
                     elif event_type == "task_complete":
                         status = "failed" if payload.get("error") is not None else "completed"
+                        turn_id = str(payload.get("turn_id") or "")
+                        if current_turn is None:
+                            current_turn = {
+                                "turn_id": turn_id or str(record.get("timestamp") or ""),
+                                "status": status,
+                                "user_messages": [],
+                                "agent_messages": [],
+                            }
+                            turns.append(current_turn)
+                        elif turn_id and current_turn.get("turn_id") != turn_id:
+                            current_turn["turn_id"] = turn_id
+                            for message in current_turn["agent_messages"]:
+                                message["turn_id"] = turn_id
+                        current_turn["status"] = status
                         active_turn_id = None
+                        current_turn = None
                     elif event_type == "turn_aborted":
                         status = "interrupted"
+                        if current_turn is not None:
+                            current_turn["status"] = "interrupted"
                         active_turn_id = None
+                        current_turn = None
+                    elif event_type == "user_message":
+                        text = payload.get("message")
+                        if not isinstance(text, str) or not text.strip():
+                            continue
+                        if current_turn is None:
+                            current_turn = {
+                                "turn_id": str(payload.get("turn_id") or record.get("timestamp") or ""),
+                                "status": "unknown",
+                                "user_messages": [],
+                                "agent_messages": [],
+                            }
+                            turns.append(current_turn)
+                        current_turn["user_messages"].append({
+                            "id": str(payload.get("id") or record.get("timestamp") or ""),
+                            "kind": (
+                                "initial" if not current_turn["user_messages"] else "steering"
+                            ),
+                            "text": text.strip()[:4000],
+                        })
                     elif event_type == "agent_message" and payload.get("phase") in {
                         "commentary", "final_answer"
                     }:
                         text = payload.get("message")
                         if not isinstance(text, str) or not text.strip():
                             continue
-                        messages.append({
+                        message = {
                             "id": str(payload.get("id") or record.get("timestamp") or ""),
-                            "turn_id": str(payload.get("turn_id") or ""),
+                            "turn_id": str(
+                                payload.get("turn_id")
+                                or (current_turn or {}).get("turn_id")
+                                or ""
+                            ),
                             "phase": payload.get("phase"),
                             "text": text.strip()[:4000],
-                        })
+                        }
+                        messages.append(message)
+                        if current_turn is None:
+                            current_turn = {
+                                "turn_id": message["turn_id"] or str(record.get("timestamp") or ""),
+                                "status": "unknown",
+                                "user_messages": [],
+                                "agent_messages": [],
+                            }
+                            turns.append(current_turn)
+                            message["turn_id"] = current_turn["turn_id"]
+                        current_turn["agent_messages"].append(dict(message))
         except OSError:
             logger.debug("无法读取 Desktop rollout 基线", exc_info=True)
             return state
@@ -889,9 +1314,25 @@ class DesktopBridgeManager:
             status = (
                 "running" if messages[-1].get("phase") == "commentary" else "completed"
             )
+        if turns and not turns[-1]["user_messages"]:
+            recent_users = _recent_rollout_user_messages(matches[0])
+            if not recent_users:
+                for turn in reversed(turns[:-1]):
+                    if turn["user_messages"]:
+                        recent_users = [dict(message) for message in turn["user_messages"]]
+                        break
+            if recent_users:
+                # Goal continuation and other internal turns can emit a new
+                # task_started without another user_message.  Keep the latest
+                # user-authored query visible on that live turn.
+                turns[-1]["user_messages"] = recent_users
         state["status"] = status
         state["active_turn_id"] = active_turn_id
+        state["turns"] = turns[-20:]
         state["messages"] = messages[-20:]
+        state["_patch_turn_ids"] = (
+            {'["turns",0]': str(active_turn_id)} if active_turn_id else {}
+        )
         return state
 
     def _title_from_index(self, thread_id: str) -> Optional[str]:
@@ -973,6 +1414,51 @@ def _safe_string_map(value: Any) -> Dict[str, str]:
     }
 
 
+def _path_value(value: Any) -> Optional[Path]:
+    if not isinstance(value, (str, Path)):
+        return None
+    text = str(value).strip()
+    return Path(text) if text and "\x00" not in text else None
+
+
+def _read_rollout_metadata_file(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            record = json.loads(source.readline())
+    except (OSError, json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    payload = record.get("payload") if isinstance(record, Mapping) else None
+    if not isinstance(payload, Mapping):
+        return {}
+    git = payload.get("git")
+    repository_url = git.get("repository_url") if isinstance(git, Mapping) else None
+    return {
+        "thread_id": _clean_thread_id(payload.get("id") or payload.get("session_id")),
+        "cwd": payload.get("cwd") if isinstance(payload.get("cwd"), str) else None,
+        "originator": (
+            payload.get("originator") if isinstance(payload.get("originator"), str) else None
+        ),
+        "_is_child": bool(payload.get("parent_thread_id")),
+        "_git_repository_url": (
+            repository_url if isinstance(repository_url, str) else None
+        ),
+    }
+
+
+def _iso_timestamp(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = float(value) / 1000 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            )
+        except (OSError, OverflowError, ValueError):
+            return ""
+    return ""
+
+
 def _resolved_path(value: Any) -> Optional[Path]:
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
         return None
@@ -1032,9 +1518,86 @@ def _loading_state(thread_id: str) -> Dict[str, Any]:
         "title": "Codex Desktop",
         "status": "unknown",
         "active_turn_id": None,
+        "turns": [],
         "messages": [],
         "pending": None,
     }
+
+
+def _recent_rollout_user_messages(path: Path) -> List[Dict[str, str]]:
+    """在有界字节窗口内反向找最近一个用户轮的公开文本。
+
+    rollout 可能有数百 MiB，且当前 turn 的工具输出可轻易超过初始
+    8 MiB 尾窗。这里用 mmap 只在有界窗口内反向定位事件标记，
+    并对单行长度另外限制，避免为找 Query 物化整个大文件。
+    """
+
+    event_markers = (
+        b'"type":"user_message"',
+        b'"type": "user_message"',
+        b'"type":"task_started"',
+        b'"type": "task_started"',
+    )
+    found: List[Dict[str, str]] = []
+    try:
+        with path.open("rb") as source:
+            size = source.seek(0, os.SEEK_END)
+            if size <= 0:
+                return []
+            scan_start = max(0, size - ROLLOUT_QUERY_SCAN_BYTES)
+            with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                search_end = size
+                while search_end > scan_start:
+                    offset = max(
+                        data.rfind(marker, scan_start, search_end)
+                        for marker in event_markers
+                    )
+                    if offset < 0:
+                        break
+                    search_end = offset
+                    line_floor = max(0, offset - ROLLOUT_QUERY_LINE_BYTES)
+                    line_start = data.rfind(b"\n", line_floor, offset) + 1
+                    line_end = data.find(
+                        b"\n",
+                        offset,
+                        min(size, offset + ROLLOUT_QUERY_LINE_BYTES),
+                    )
+                    if line_end < 0:
+                        line_end = size
+                    if line_end - line_start > ROLLOUT_QUERY_LINE_BYTES:
+                        continue
+                    try:
+                        record = json.loads(data[line_start:line_end])
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(record, Mapping) or record.get("type") != "event_msg":
+                        continue
+                    payload = record.get("payload")
+                    if not isinstance(payload, Mapping):
+                        continue
+                    event_type = payload.get("type")
+                    if event_type == "task_started":
+                        if found:
+                            break
+                        continue
+                    if event_type != "user_message":
+                        continue
+                    text = payload.get("message")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    found.append({
+                        "id": str(payload.get("id") or record.get("timestamp") or ""),
+                        "kind": "initial",
+                        "text": text.strip()[:4000],
+                    })
+    except (OSError, ValueError):
+        logger.debug("无法反向读取 Desktop rollout Query", exc_info=True)
+        return []
+
+    found.reverse()
+    for index, message in enumerate(found):
+        message["kind"] = "initial" if index == 0 else "steering"
+    return found
 
 
 def _public_state_key(state: Optional[Mapping[str, Any]]) -> Any:
@@ -1044,6 +1607,7 @@ def _public_state_key(state: Optional[Mapping[str, Any]]) -> Any:
         state.get("title"),
         state.get("status"),
         state.get("active_turn_id"),
+        state.get("turns"),
         state.get("messages"),
         state.get("pending"),
     )

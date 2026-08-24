@@ -32,8 +32,11 @@ Codex CLI 的终端桥接能力。项目采用可扩展方向设计，后续可�
   不抢占 writer lock。
 - **双向实时通信**：空闲任务开始新 turn，运行中任务通过 steer 追加消息。
 - **单卡片持续更新**：进度、最终回复、运行状态在同一张飞书卡片中刷新。
+- **按轮次浏览**：卡片只展示当前 Query 及对应进度，可前后翻看历史 turn。
+- **完成主动提醒**：每轮成功或失败后主动私聊通知，并可从提醒卡片一键重连。
 - **会话快速定位**：按项目名、完整工作目录和 Session ID 展示 Desktop 任务。
 - **分页任务列表**：每页显示 5 个任务，可在卡片内前后翻页。
+- **归档任务管理**：活动列表自动排除归档任务，支持独立查询、恢复和进入。
 - **运行状态识别**：`🟢` 运行中、`🔴` 最近一次执行失败、`⚪` 空闲。
 - **交互处理**：支持停止任务、命令审批、权限审批和用户输入。
 - **CLI 兼容模式**：继续支持 Claude CLI、Codex CLI 与 tmux 会话。
@@ -97,6 +100,8 @@ remote-claude lark status
 任务列表第一行显示项目名，第二行显示 Session 名，并附带 Session ID、工作目录和
 更新时间。状态图标分别表示：`🟢` 运行中、`🔴` 最近一次执行失败、`⚪` 空闲。
 点击“进入”后，即可通过普通飞书消息或卡片输入框继续该 Desktop 任务。
+首次使用 `/desktop`、`/archived` 或直接连接任务后，机器人会为当前用户启用完成提醒；
+提醒只覆盖启用之后完成的 turn，不会补发历史记录。
 
 ## 飞书命令
 
@@ -107,6 +112,7 @@ remote-claude lark status
 | `/desktop` | 分页列出所有 Codex Desktop 任务，每页 5 个 |
 | `/desktop <session-id>` | 连接指定 Desktop 任务 |
 | `/desktop <codex://threads/...>` | 使用完整任务链接连接 |
+| `/archived` | 分页查看已归档任务，可恢复或恢复并进入 |
 | `/desktop-status` | 刷新当前 Desktop 状态卡片 |
 | `/desktop-stop` | 停止当前 turn |
 | `/desktop-detach` | 停止跟随，Desktop 任务继续运行 |
@@ -180,6 +186,8 @@ PTY、tmux 和共享内存同步终端内容。飞书侧使用 CardKit 卡片承
 ```bash
 UV_PYTHON=3.13 PYTHONPATH=. uv run --with pytest --with pytest-asyncio \
   python3 -m pytest -q \
+  tests/test_codex_app_server.py \
+  tests/test_desktop_notifications.py \
   tests/test_desktop_ipc.py \
   tests/test_desktop_card.py \
   tests/test_desktop_bridge.py \
@@ -196,6 +204,9 @@ UV_PYTHON=3.13 PYTHONPATH=. uv run --with pytest --with pytest-asyncio \
 ## Roadmap
 
 - [x] Codex Desktop + 飞书双向控制
+- [x] Session 完成/失败主动通知与一键重连
+- [x] 按单轮 Query 浏览实时卡片历史
+- [x] 归档任务独立查询、恢复及恢复后连接
 - [x] Claude CLI / Codex CLI + 飞书
 - [ ] Claude Desktop 适配
 - [ ] 标准化 Agent Desktop Adapter

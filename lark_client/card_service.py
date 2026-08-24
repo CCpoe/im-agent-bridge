@@ -112,8 +112,15 @@ class CardService:
         _track_stats('error', 'card_api', detail='create_card')
         return None
 
-    async def send_card(self, chat_id: str, card_id: str) -> Optional[str]:
-        """发送卡片消息，返回 message_id"""
+    async def send_card(
+        self,
+        receive_id: str,
+        card_id: str,
+        *,
+        receive_id_type: str = "chat_id",
+        message_uuid: Optional[str] = None,
+    ) -> Optional[str]:
+        """发送卡片消息，返回 message_id。"""
         if not self.client:
             return None
 
@@ -125,15 +132,15 @@ class CardService:
                 "data": {"card_id": card_id}
             }
 
+            body_builder = CreateMessageRequestBody.builder() \
+                .receive_id(receive_id) \
+                .msg_type("interactive") \
+                .content(json.dumps(card_content))
+            if message_uuid:
+                body_builder = body_builder.uuid(message_uuid)
             request = CreateMessageRequest.builder() \
-                .receive_id_type("chat_id") \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(chat_id)
-                    .msg_type("interactive")
-                    .content(json.dumps(card_content))
-                    .build()
-                ) \
+                .receive_id_type(receive_id_type) \
+                .request_body(body_builder.build()) \
                 .build()
 
             response = await asyncio.to_thread(
@@ -163,6 +170,25 @@ class CardService:
             self._cards_by_message_id[message_id] = state
             logger.info(f"已记录卡片: msg={message_id}, card={card_id}")
         return message_id
+
+    async def create_and_send_card_to_user(
+        self,
+        user_id: str,
+        card_content: Dict[str, Any],
+        *,
+        message_uuid: Optional[str] = None,
+    ) -> Optional[str]:
+        """发送独立私聊卡片，不替换聊天中的活跃流式卡片。"""
+
+        card_id = await self.create_card(card_content)
+        if not card_id:
+            return None
+        return await self.send_card(
+            user_id,
+            card_id,
+            receive_id_type="open_id",
+            message_uuid=message_uuid,
+        )
 
     async def update_card_by_message_id(
         self, message_id: str, card_content: Dict[str, Any]
