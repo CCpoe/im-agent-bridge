@@ -316,6 +316,7 @@ def test_desktop_list_card_uses_thread_ids_for_attach():
             "thread_id": "thread-1",
             "title": "Desktop 会话",
             "project_name": "测试项目",
+            "status": "running",
             "cwd": "/workspace",
             "updated_at": "2026-08-24T16:00:00Z",
         }
@@ -323,12 +324,40 @@ def test_desktop_list_card_uses_thread_ids_for_attach():
     rendered = json.dumps(card, ensure_ascii=False)
 
     assert "Desktop 会话" in rendered
-    assert "项目：**测试项目**" in rendered
+    assert "🟢 **测试项目**" in rendered
+    assert "Session：**Desktop 会话**" in rendered
     assert "Session ID：`thread-1`" in rendered
     assert "目录：`/workspace`" in rendered
     assert '"action": "desktop_attach"' in rendered
     assert '"thread_id": "thread-1"' in rendered
     assert '"action": "desktop_list_page"' not in rendered
+
+
+@pytest.mark.parametrize(("status", "icon"), [
+    ("running", "🟢"),
+    ("waiting_approval", "🟢"),
+    ("waiting_input", "🟢"),
+    ("failed", "🔴"),
+    ("idle", "⚪"),
+    ("completed", "⚪"),
+    ("unknown", "⚪"),
+    (None, "⚪"),
+])
+def test_desktop_list_card_uses_runtime_status_not_binding(status, icon):
+    card = build_desktop_list_card([{
+        "thread_id": "thread-1",
+        "title": "同名会话",
+        "project_name": "项目甲",
+        "status": status,
+    }], current_thread_id="thread-1")
+    details = card["body"]["elements"][0]["columns"][0]["elements"][0]["content"]
+
+    assert details.splitlines()[:2] == [
+        f"{icon} **项目甲**",
+        "Session：**同名会话**",
+    ]
+    button = card["body"]["elements"][0]["columns"][1]["elements"][0]
+    assert button["behaviors"][0]["value"]["action"] == "desktop_detach"
 
 
 def test_desktop_list_card_paginates_five_threads_and_clamps_page():

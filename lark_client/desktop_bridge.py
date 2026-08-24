@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import mmap
 import os
 import time
 from pathlib import Path
@@ -62,6 +63,7 @@ class DesktopBridgeManager:
         self._users: Dict[str, str] = {}
         self._states: Dict[str, Dict[str, Any]] = {}
         self._thread_metadata: Dict[str, Dict[str, Any]] = {}
+        self._rollout_status_cache: Dict[str, tuple[int, int, str]] = {}
         self._chat_locks: Dict[str, asyncio.Lock] = {}
         self._operation_locks: Dict[str, asyncio.Lock] = {}
         self._resolved_requests: Dict[tuple[str, str, str, str, str], float] = {}
@@ -268,7 +270,15 @@ class DesktopBridgeManager:
                 item.get("_git_repository_url"),
                 project_catalog,
             )
+            live_state = self._states.get(item["id"])
+            live_status = (
+                live_state.get("status") if isinstance(live_state, Mapping) else None
+            )
+            item["status"] = _list_status(live_status)
+            if item["status"] == "idle" and live_status in (None, "unknown"):
+                item["status"] = self._rollout_status(item.get("_rollout_path"))
             item.pop("_git_repository_url", None)
+            item.pop("_rollout_path", None)
             results.append(item)
         results.sort(
             key=lambda item: (item.get("_activity_mtime", 0), item["updated_at"]),
@@ -329,6 +339,7 @@ class DesktopBridgeManager:
                         "_git_repository_url": (
                             repository_url if isinstance(repository_url, str) else None
                         ),
+                        "_rollout_path": str(path),
                         "_timestamp": timestamp if isinstance(timestamp, str) else "",
                         "_activity_mtime": path.stat().st_mtime,
                     }
@@ -340,6 +351,51 @@ class DesktopBridgeManager:
             value.pop("_timestamp", None)
         self._thread_metadata.update(found)
         return found
+
+    def _rollout_status(self, raw_path: Any) -> str:
+        """Return the last persisted turn status without parsing whole rollouts."""
+
+        if not isinstance(raw_path, str) or not raw_path:
+            return "idle"
+        path = Path(raw_path)
+        try:
+            with path.open("rb") as source:
+                stat = os.fstat(source.fileno())
+                cache_key = str(path)
+                cached = self._rollout_status_cache.get(cache_key)
+                if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+                    return cached[2]
+                if stat.st_size <= 0:
+                    status = "idle"
+                else:
+                    with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                        status = "idle"
+                        end = stat.st_size
+                        while end > 0:
+                            if data[end - 1:end] == b"\n":
+                                end -= 1
+                            start = data.rfind(b"\n", 0, end) + 1
+                            prefix = data[start:min(end, start + 4096)]
+                            if b"task_" in prefix or b"turn_aborted" in prefix:
+                                candidate = _rollout_record_status(data[start:end])
+                                if candidate is not None:
+                                    status = candidate
+                                    break
+                            end = start - 1
+        except (OSError, ValueError):
+            status = "idle"
+            stat = None
+
+        if stat is not None:
+            self._rollout_status_cache[str(path)] = (
+                stat.st_size,
+                stat.st_mtime_ns,
+                status,
+            )
+            if len(self._rollout_status_cache) > 512:
+                oldest = next(iter(self._rollout_status_cache))
+                self._rollout_status_cache.pop(oldest, None)
+        return status
 
     def _load_project_catalog(self) -> Dict[str, Any]:
         """读取 Desktop 项目映射，只保留展示项目名所需的字段。"""
@@ -809,7 +865,10 @@ class DesktopBridgeManager:
                         status = "running"
                         active_turn_id = payload.get("turn_id")
                     elif event_type == "task_complete":
-                        status = "completed"
+                        status = "failed" if payload.get("error") is not None else "completed"
+                        active_turn_id = None
+                    elif event_type == "turn_aborted":
+                        status = "interrupted"
                         active_turn_id = None
                     elif event_type == "agent_message" and payload.get("phase") in {
                         "commentary", "final_answer"
@@ -933,6 +992,34 @@ def _repository_name(value: Any) -> str:
     if name.endswith(".git"):
         name = name[:-4]
     return _safe_label(name, 120)
+
+
+def _list_status(value: Any) -> str:
+    if value in {"running", "waiting_approval", "waiting_input", "active"}:
+        return "running"
+    if value in {"failed", "systemError"}:
+        return "failed"
+    return "idle"
+
+
+def _rollout_record_status(raw_line: Any) -> Optional[str]:
+    try:
+        record = json.loads(raw_line)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, Mapping) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    event_type = payload.get("type")
+    if event_type == "task_started":
+        return "running"
+    if event_type == "task_complete":
+        return "failed" if payload.get("error") is not None else "idle"
+    if event_type == "turn_aborted":
+        return "idle"
+    return None
 
 
 def _loading_state(thread_id: str) -> Dict[str, Any]:

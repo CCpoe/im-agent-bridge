@@ -311,6 +311,7 @@ def test_list_threads_merges_latest_index_with_safe_rollout_metadata(tmp_path):
         "cwd": "/workspace/desktop",
         "originator": "Codex Desktop",
         "project_name": "自定义项目名",
+        "status": "idle",
     }]
     serialized = json.dumps(threads)
     assert "ROLLOUT_PRIVATE_MUST_NOT_LEAK" not in serialized
@@ -355,6 +356,79 @@ def test_bad_global_state_falls_back_to_repository_name(tmp_path):
     assert bridge._project_name_for_thread(
         "thread-1", None, "https://example.com/team/fallback.git", catalog
     ) == "fallback"
+
+
+def test_rollout_status_tracks_running_failure_and_recovery(tmp_path):
+    bridge = manager(tmp_path)
+    rollout_dir = tmp_path / "sessions" / "2026" / "01" / "03"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / "rollout-test-thread-1.jsonl"
+    rollout.write_text("\n".join([
+        json.dumps({"type": "session_meta", "payload": {"id": "thread-1"}}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-1",
+        }}),
+    ]) + "\n", encoding="utf-8")
+
+    assert bridge._rollout_status(str(rollout)) == "running"
+
+    with rollout.open("a", encoding="utf-8") as target:
+        target.write(json.dumps({"type": "response_item", "payload": {
+            "type": "message", "text": '示例："type":"task_complete"',
+        }}) + "\n")
+    assert bridge._rollout_status(str(rollout)) == "running"
+
+    with rollout.open("a", encoding="utf-8") as target:
+        target.write(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-1",
+            "error": {"message": "failed"},
+        }}) + "\n")
+    assert bridge._rollout_status(str(rollout)) == "failed"
+    assert bridge._seed_state_from_rollout("thread-1")["status"] == "failed"
+
+    with rollout.open("a", encoding="utf-8") as target:
+        target.write(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-2",
+        }}) + "\n")
+        target.write(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "turn-2", "error": {},
+        }}) + "\n")
+    assert bridge._rollout_status(str(rollout)) == "failed"
+
+    with rollout.open("a", encoding="utf-8") as target:
+        target.write(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "turn-3",
+        }}) + "\n")
+        target.write(json.dumps({"type": "event_msg", "payload": {
+            "type": "turn_aborted", "turn_id": "turn-3",
+        }}) + "\n")
+    assert bridge._rollout_status(str(rollout)) == "idle"
+
+
+def test_live_desktop_state_takes_precedence_over_rollout_status(tmp_path):
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(json.dumps({
+        "id": "desktop-1",
+        "thread_name": "运行任务",
+        "updated_at": "2026-01-03T00:00:00Z",
+    }) + "\n", encoding="utf-8")
+    rollout_dir = tmp_path / "sessions" / "2026" / "01" / "03"
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / "rollout-test-desktop-1.jsonl").write_text("\n".join([
+        json.dumps({"type": "session_meta", "payload": {
+            "id": "desktop-1",
+            "cwd": "/workspace/desktop",
+            "originator": "Codex Desktop",
+        }}),
+        json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "turn_id": "turn-old",
+        }}),
+    ]) + "\n", encoding="utf-8")
+    bridge = manager(tmp_path)
+    bridge._states["desktop-1"] = {"status": "waiting_input"}
+
+    assert bridge.list_threads()[0]["status"] == "running"
 
 
 @pytest.mark.asyncio

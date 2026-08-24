@@ -17,6 +17,7 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
 - IPC 小端长度帧、initialize、request correlation、超时和重连；
 - owner discovery、follow、start/steer/interrupt、审批和用户输入；
 - `/desktop` 列表的项目映射、完整 Session ID 和每页 5 条分页；
+- `/desktop` 列表的运行中、失败和空闲状态图标；
 - snapshot 与 Immer patches；
 - 超过 256 MiB 无 snapshot 时的 rollout + patch-only 回退；
 - reasoning、命令输出和未知 schema 不进入飞书卡片；

@@ -62,6 +62,13 @@ _STATUS_TEMPLATES = {
     "unknown": "grey",
 }
 
+_LIST_STATUS_ICONS = {
+    "running": "🟢",
+    "waiting_approval": "🟢",
+    "waiting_input": "🟢",
+    "failed": "🔴",
+}
+
 
 class PatchApplyError(ValueError):
     """Raised when an Immer patch cannot be applied safely."""
@@ -1042,9 +1049,10 @@ def build_desktop_list_card(
         project_name = project_name or "未知项目"
         updated_at = _clean_text(thread.get("updated_at"), 80) or ""
         is_current = thread_id == current_thread_id
+        status_icon = _LIST_STATUS_ICONS.get(thread.get("status"), "⚪")
         details = [
-            f"{'🟢' if is_current else '⚪'} **{title}**",
-            f"项目：**{project_name}**",
+            f"{status_icon} **{project_name}**",
+            f"Session：**{title}**",
             f"Session ID：`{thread_id}`",
         ]
         if cwd:
