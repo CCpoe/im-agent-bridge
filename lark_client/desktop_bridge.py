@@ -476,7 +476,9 @@ class DesktopBridgeManager:
                         indexed[thread_id] = {
                             "id": thread_id,
                             "thread_id": thread_id,
-                            "title": _safe_title(item.get("thread_name")),
+                            # Preserve an empty index name as empty so callers
+                            # can fall back to App Server/state DB metadata.
+                            "title": _safe_label(item.get("thread_name"), 200),
                             "updated_at": updated_at,
                             "cwd": None,
                             "originator": None,
@@ -632,6 +634,10 @@ class DesktopBridgeManager:
         self, rows: Any, *, archived: bool, include_internal: bool
     ) -> List[Dict[str, Any]]:
         project_catalog = self._load_project_catalog()
+        # ``threads.title`` is often the initial user query and can remain
+        # stale after a rename.  Desktop writes the current sidebar/session
+        # label to session_index.jsonl, so prefer that value for display.
+        indexed = self._read_session_index()
         results: List[Dict[str, Any]] = []
         if not isinstance(rows, list):
             return results
@@ -665,10 +671,13 @@ class DesktopBridgeManager:
             if status == "idle" and live_status in (None, "unknown"):
                 status = self._rollout_status(str(path) if path is not None else None)
             updated_at = _iso_timestamp(raw.get("updatedAtMs") or raw.get("updatedAt"))
+            indexed_title = (indexed.get(thread_id) or {}).get("title")
             item = {
                 "id": thread_id,
                 "thread_id": thread_id,
-                "title": _safe_title(raw.get("name") or raw.get("title")),
+                "title": _safe_title(
+                    indexed_title or raw.get("name") or raw.get("title")
+                ),
                 "updated_at": updated_at,
                 "cwd": cwd if isinstance(cwd, str) else None,
                 "originator": originator or "Codex Desktop",

@@ -539,6 +539,145 @@ def test_active_thread_list_excludes_archived_rows_in_state_db(tmp_path):
     ]
 
 
+def test_state_db_uses_desktop_session_index_name_instead_of_query_title(tmp_path):
+    rollout_dir = tmp_path / "sessions"
+    rollout_dir.mkdir()
+    rollout = rollout_dir / "rollout-active-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "active-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+    (tmp_path / "session_index.jsonl").write_text("\n".join([
+        json.dumps({
+            "id": "active-1",
+            "thread_name": "旧名称",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }),
+        json.dumps({
+            "id": "active-1",
+            "thread_name": "Desktop GUI 名称",
+            "updated_at": "2026-01-02T00:00:00Z",
+        }),
+    ]) + "\n", encoding="utf-8")
+
+    connection = sqlite3.connect(tmp_path / "state.sqlite")
+    connection.execute("""
+        CREATE TABLE threads (
+            id TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT,
+            cwd TEXT, title TEXT, archived INTEGER, recency_at_ms INTEGER,
+            name TEXT
+        )
+    """)
+    connection.execute(
+        "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "active-1", str(rollout), 2, "vscode", "/workspace",
+            "这其实是首轮 Query，不是会话名", 0, 2, None,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    threads = manager(tmp_path).list_threads(None)
+
+    assert threads[0]["title"] == "Desktop GUI 名称"
+
+
+@pytest.mark.asyncio
+async def test_app_server_archived_uses_desktop_session_index_name(tmp_path):
+    archived_dir = tmp_path / "archived_sessions"
+    archived_dir.mkdir()
+    rollout = archived_dir / "rollout-archived-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "archived-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+    (tmp_path / "session_index.jsonl").write_text(json.dumps({
+        "id": "archived-1",
+        "thread_name": "已归档 GUI 名称",
+        "updated_at": "2026-01-02T00:00:00Z",
+    }) + "\n", encoding="utf-8")
+    app_server = FakeAppServer([{
+        "id": "archived-1",
+        "title": "归档前的首轮 Query",
+        "name": None,
+        "cwd": "/workspace",
+        "source": "vscode",
+        "path": str(rollout),
+        "updatedAt": 2,
+    }])
+    bridge = manager(tmp_path, app_server_client=app_server)
+
+    threads = await bridge.get_archived_threads()
+
+    assert threads[0]["title"] == "已归档 GUI 名称"
+
+
+def test_state_db_title_is_used_when_session_index_has_no_thread(tmp_path):
+    rollout_dir = tmp_path / "sessions"
+    rollout_dir.mkdir()
+    rollout = rollout_dir / "rollout-active-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "active-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+
+    connection = sqlite3.connect(tmp_path / "state.sqlite")
+    connection.execute("""
+        CREATE TABLE threads (
+            id TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT,
+            cwd TEXT, title TEXT, archived INTEGER, recency_at_ms INTEGER,
+            name TEXT
+        )
+    """)
+    connection.execute(
+        "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "active-1", str(rollout), 2, "vscode", "/workspace",
+            "数据库回退名称", 0, 2, None,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    assert manager(tmp_path).list_threads(None)[0]["title"] == "数据库回退名称"
+
+
+def test_empty_session_index_name_falls_back_to_state_db_title(tmp_path):
+    rollout_dir = tmp_path / "sessions"
+    rollout_dir.mkdir()
+    rollout = rollout_dir / "rollout-active-1.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "active-1", "originator": "Codex Desktop"},
+    }) + "\n", encoding="utf-8")
+    (tmp_path / "session_index.jsonl").write_text(json.dumps({
+        "id": "active-1",
+        "thread_name": "",
+        "updated_at": "2026-01-02T00:00:00Z",
+    }) + "\n", encoding="utf-8")
+
+    connection = sqlite3.connect(tmp_path / "state.sqlite")
+    connection.execute("""
+        CREATE TABLE threads (
+            id TEXT, rollout_path TEXT, updated_at INTEGER, source TEXT,
+            cwd TEXT, title TEXT, archived INTEGER, recency_at_ms INTEGER,
+            name TEXT
+        )
+    """)
+    connection.execute(
+        "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "active-1", str(rollout), 2, "vscode", "/workspace",
+            "数据库回退名称", 0, 2, None,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    assert manager(tmp_path).list_threads(None)[0]["title"] == "数据库回退名称"
+
+
 @pytest.mark.asyncio
 async def test_unarchive_is_idempotent_under_concurrent_callbacks(tmp_path):
     archived_dir = tmp_path / "archived_sessions"
