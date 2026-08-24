@@ -1,0 +1,18 @@
+services:
+  npm-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    container_name: remote-claude-npm-test
+    volumes:
+      # 只读挂载项目代码（防止测试意外修改源代码）
+      - ..:/project:ro
+      # 测试结果输出目录（可写）
+      - ../test-results:/home/testuser/test-results
+    working_dir: /project
+    environment:
+      - NPM_CONFIG_CACHE=/tmp/npm-cache
+      - SKIP_CLAUDE_LOGIN=1  # 跳过 Claude 登录
+      - CI=true              # CI 模式
+    stdin_open: true
+    tty: true

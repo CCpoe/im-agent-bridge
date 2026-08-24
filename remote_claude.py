@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""
+IM Agent Bridge - 远程控制 Desktop AI Agent 与 CLI 会话
+
+命令:
+  start <name>       启动新会话（在 tmux 中）
+  attach <name>      连接到已有会话
+  list               列出所有会话
+  kill <name>        终止会话
+  status <name>      显示会话状态
+  lark               飞书客户端管理（start/stop/restart/status）
+  stats              查看使用统计
+  update             更新 remote-claude 到最新版本
+"""
+
+import argparse
+import logging
+import os
+import sys
+import subprocess
+import time
+import signal
+from datetime import datetime
+from pathlib import Path
+
+# 确保项目根目录在 sys.path 中，以便 import client / server 子模块
+_PROJECT_ROOT = str(Path(__file__).parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from utils.session import (
+    get_socket_path, get_pid_file, ensure_socket_dir,
+    get_tmux_session_name, tmux_session_exists, tmux_create_session,
+    tmux_kill_session,
+    list_active_sessions, is_session_active, cleanup_session,
+    is_lark_running, get_lark_pid, get_lark_status, get_lark_pid_file,
+    save_lark_status, cleanup_lark, kill_all_lark_processes,
+    USER_DATA_DIR, ensure_user_data_dir, get_lark_log_file,
+    get_env_snapshot_path,
+)
+
+
+# 获取脚本所在目录
+SCRIPT_DIR = Path(__file__).parent.absolute()
+
+# 读取版本号（仅 import 时读取一次）
+try:
+    import json as _json
+    _VERSION = _json.loads((SCRIPT_DIR / "package.json").read_text())["version"]
+except Exception:
+    _VERSION = "unknown"
+
+
+def cmd_start(args):
+    """启动新会话"""
+    session_name = args.name
+
+    # 检查会话是否已存在
+    if is_session_active(session_name):
+        print(f"错误: 会话 '{session_name}' 已存在")
+        print(f"使用 'remote-claude attach {session_name}' 连接")
+        return 1
+
+    # 检查 tmux 会话是否存在
+    if tmux_session_exists(session_name):
+        print(f"错误: tmux 会话 'rc-{session_name}' 已存在")
+        print("请先使用 'remote-claude kill {session_name}' 清理")
+        return 1
+
+    ensure_socket_dir()
+
+    # 将当前 shell 的完整环境变量保存到快照文件（权限 0600 防止密钥泄露）
+    # tmux new-session 继承的是 tmux 服务器的全局环境，而非调用方 shell 的环境，
+    # 通过快照文件将完整环境传递给 server.py 的 _start_pty()
+    import json
+    env_snapshot_path = get_env_snapshot_path(session_name)
+    env_fd = os.open(str(env_snapshot_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(env_fd, 'w') as f:
+        json.dump(dict(os.environ), f)
+
+    # 构建 server 命令
+    server_script = SCRIPT_DIR / "server" / "server.py"
+    claude_args = args.claude_args if args.claude_args else []
+    claude_args_str = " ".join(f"'{arg}'" for arg in claude_args)
+    debug_flag = " --debug-screen" if getattr(args, "debug_screen", False) else ""
+    debug_verbose_flag = " --debug-verbose" if getattr(args, "debug_verbose", False) else ""
+    cli_type = getattr(args, "cli", "claude")
+    cli_type_flag = f" --cli-type {cli_type}" if cli_type != "claude" else ""
+
+    # 捕获用户终端环境变量（tmux 会覆盖这些值，导致 Claude CLI 无法启用 kitty keyboard protocol）
+    env_prefix = ""
+    for key in ('TERM_PROGRAM', 'TERM_PROGRAM_VERSION', 'COLORTERM'):
+        val = os.environ.get(key)
+        if val:
+            env_prefix += f"{key}='{val}' "
+
+    server_cmd = f"{env_prefix}uv run --project '{SCRIPT_DIR}' python3 '{server_script}'{debug_flag}{debug_verbose_flag}{cli_type_flag} -- '{session_name}' {claude_args_str}"
+
+    # 配置启动日志（写文件 + stdout）
+    _log_path = USER_DATA_DIR / "startup.log"
+    _start_logger = logging.getLogger('Start')
+    if not _start_logger.handlers:
+        _handler_file = logging.FileHandler(_log_path, encoding="utf-8")
+        _handler_file.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        _start_logger.addHandler(_handler_file)
+        _start_logger.setLevel(logging.INFO)
+        _start_logger.propagate = False
+
+    start_time = datetime.now()
+    _start_logger.info(f"启动会话: {session_name}")
+    _start_logger.info(f"server_cmd: {server_cmd}")
+
+    # 创建 tmux 会话，运行 server（detached，仅后台）
+    if not tmux_create_session(session_name, server_cmd, detached=True):
+        print("错误: 无法创建 tmux 会话")
+        return 1
+
+    # 等待 server 启动
+    socket_path = get_socket_path(session_name)
+    for i in range(50):  # 最多等待 5 秒
+        if socket_path.exists():
+            break
+        time.sleep(0.1)
+        if (i + 1) % 10 == 0:
+            elapsed = (i + 1) // 10
+            print(f"等待 Server 启动... ({elapsed}s)")
+    else:
+        print("错误: Server 启动超时 (5s)")
+        # 过滤出本次启动后的日志行
+        if _log_path.exists():
+            lines = []
+            for line in _log_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    ts = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S.%f")
+                    if ts >= start_time:
+                        lines.append(line)
+                except ValueError:
+                    if lines:  # 多行日志的续行，附到上一条
+                        lines.append(line)
+            if lines:
+                print(f"--- Server 日志 ({_log_path}) ---")
+                print("\n".join(lines))
+                print("-------------------")
+        tmux_kill_session(session_name)
+        return 1
+
+    print(f"会话已启动: rc-{session_name}")
+    print(f"正在连接...")
+
+    # 直接在前台运行 client（不走 tmux），让终端能力协商序列
+    # （如 kitty keyboard protocol）直接在 Claude CLI ↔ 用户终端之间流通，
+    # 从而支持 Shift+Enter 等扩展键
+    from client.client import run_client
+    run_client(session_name)
+
+    return 0
+
+
+def cmd_attach(args):
+    """连接到已有会话"""
+    session_name = args.name
+
+    # 检查会话是否存在
+    if not is_session_active(session_name):
+        print(f"错误: 会话 '{session_name}' 不存在")
+        print("使用 'remote-claude list' 查看可用会话")
+        return 1
+
+    print(f"连接到会话: {session_name}")
+
+    # 直接运行 client（不通过 tmux）
+    from client.client import run_client
+    run_client(session_name)
+
+    return 0
+
+
+def cmd_list(args):
+    """列出所有会话"""
+    sessions = list_active_sessions()
+
+    if not sessions:
+        print("没有活跃的会话")
+        return 0
+
+    # ANSI 颜色码
+    YELLOW = "\033[33m"
+    GREEN = "\033[32m"
+    RESET = "\033[0m"
+
+    print("活跃会话:")
+    print("-" * 50)
+    print(f"{'类型':<8} {'PID':<10} {'tmux':<10} {'名称'}")
+    print("-" * 50)
+
+    for s in sessions:
+        tmux_status = "是" if s["tmux"] else "否"
+        cli_type = s.get('cli_type', 'claude')
+        # 根据类型选择颜色
+        if cli_type == 'codex':
+            cli_colored = f"{GREEN}{cli_type}{RESET}"
+        else:
+            cli_colored = f"{YELLOW}{cli_type}{RESET}"
+        # 带颜色的字段需要单独计算宽度
+        padding = " " * (8 - len(cli_type))
+        print(f"{cli_colored}{padding} {s['pid']:<10} {tmux_status:<10} {s['name']}")
+
+    print("-" * 50)
+    print(f"共 {len(sessions)} 个会话")
+
+    return 0
+
+
+def _find_session_by_pid(pid: int):
+    """通过 PID 查找对应会话名"""
+    for session in list_active_sessions():
+        if session.get("pid") == pid:
+            return session["name"]
+    return None
+
+
+def cmd_kill(args):
+    """终止会话"""
+    session_name = args.name
+
+    # 若参数是纯数字，按 PID 反查会话名
+    if session_name.isdigit():
+        pid = int(session_name)
+        matched = _find_session_by_pid(pid)
+        if not matched:
+            print(f"错误: 未找到 PID={pid} 对应的会话")
+            return 1
+        session_name = matched
+        print(f"PID {pid} 对应会话: {session_name}")
+
+    # 检查会话是否存在
+    if not is_session_active(session_name) and not tmux_session_exists(session_name):
+        print(f"错误: 会话 '{session_name}' 不存在")
+        return 1
+
+    print(f"终止会话: {session_name}")
+
+    # 终止 tmux 会话
+    if tmux_session_exists(session_name):
+        tmux_kill_session(session_name)
+        print("  - tmux 会话已终止")
+
+    # 清理文件
+    cleanup_session(session_name)
+    print("  - 文件已清理")
+
+    print("完成")
+    return 0
+
+
+def cmd_status(args):
+    """显示会话状态（连接到会话并获取状态）"""
+    session_name = args.name
+
+    if not is_session_active(session_name):
+        print(f"错误: 会话 '{session_name}' 不存在")
+        return 1
+
+    # TODO: 实现状态查询
+    print(f"会话 '{session_name}' 状态:")
+    print("  (功能开发中)")
+    return 0
+
+
+WATCHDOG_SCRIPT = USER_DATA_DIR / "watchdog.sh"
+WATCHDOG_PID_FILE = USER_DATA_DIR / "watchdog.pid"
+
+
+def _start_watchdog():
+    """启动后台 watchdog（如果尚未运行）"""
+    if not WATCHDOG_SCRIPT.exists():
+        return  # 脚本不存在时静默跳过
+    # 检查是否已在运行
+    if WATCHDOG_PID_FILE.exists():
+        try:
+            pid = int(WATCHDOG_PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            return  # 已在运行
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+    process = subprocess.Popen(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        stdout=subprocess.DEVNULL,  # watchdog 通过 tee 自己写 $LOG，不需要 stdout 捕获
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print(f"  watchdog: 已启动 (PID: {process.pid})")
+
+
+def _stop_watchdog():
+    """停止后台 watchdog"""
+    if not WATCHDOG_PID_FILE.exists():
+        return
+    try:
+        pid = int(WATCHDOG_PID_FILE.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"  watchdog: 已停止 (PID: {pid})")
+    except (ProcessLookupError, ValueError, OSError):
+        pass
+    WATCHDOG_PID_FILE.unlink(missing_ok=True)
+
+
+def cmd_lark_start(args):
+    """启动飞书客户端（守护进程）"""
+    if is_lark_running():
+        print("飞书客户端已在运行")
+        status = get_lark_status()
+        if status:
+            print(f"PID: {status['pid']}")
+            print(f"启动时间: {status['start_time']}")
+            print(f"运行时长: {status['uptime']}")
+        print("\n使用 'remote-claude lark stop' 停止")
+        return 1
+
+    print("正在启动飞书客户端...")
+
+    ensure_socket_dir()
+    ensure_user_data_dir()
+
+    # 启动前清理残留进程
+    stale = kill_all_lark_processes()
+    if stale:
+        print(f"  清理了 {len(stale)} 个残留进程: {stale}")
+
+    # 启动守护进程（使用 -m 模块方式运行，确保相对导入正常工作）
+    log_file = get_lark_log_file()
+
+    try:
+        # 启动进程
+        process = subprocess.Popen(
+            ["uv", "run", "--project", str(SCRIPT_DIR), "python3", "-m", "lark_client.main"],
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # 创建新的进程组
+            cwd=str(SCRIPT_DIR)
+        )
+
+        # 保存 PID
+        pid = process.pid
+        get_lark_pid_file().write_text(str(pid))
+        save_lark_status(pid)
+
+        # 等待一下确认启动成功
+        time.sleep(1)
+
+        if is_lark_running():
+            print(f"✓ 飞书客户端已启动")
+            print(f"  PID: {pid}")
+            print(f"  日志: {log_file}")
+            print(f"\n使用 'python3 remote_claude.py lark status' 查看状态")
+            print(f"使用 'python3 remote_claude.py lark stop' 停止")
+            _start_watchdog()
+            return 0
+        else:
+            print("✗ 启动失败，请查看日志:")
+            print(f"  tail -f {log_file}")
+            cleanup_lark()
+            return 1
+
+    except Exception as e:
+        print(f"✗ 启动失败: {e}")
+        cleanup_lark()
+        return 1
+
+
+def cmd_lark_stop(args):
+    """停止飞书客户端"""
+    if not is_lark_running():
+        print("飞书客户端未运行")
+        cleanup_lark()
+        return 0
+
+    pid = get_lark_pid()
+    if pid is None:
+        print("无法获取 PID，清理残留文件")
+        cleanup_lark()
+        return 1
+
+    print(f"正在停止飞书客户端 (PID: {pid})...")
+
+    try:
+        # 杀整个进程组（uv 父进程 + Python 子进程一起杀）
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)  # 降级
+
+        # 等待进程退出
+        for i in range(50):  # 最多等待 5 秒
+            if not is_lark_running():
+                break
+            time.sleep(0.1)
+        else:
+            # 如果还没退出，强制终止
+            print("进程未响应，强制终止...")
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+            time.sleep(0.5)
+
+        # 清理所有残留 lark_client 进程
+        stale = kill_all_lark_processes()
+        if stale:
+            print(f"  清理了 {len(stale)} 个残留进程: {stale}")
+
+        if not is_lark_running():
+            print("✓ 飞书客户端已停止")
+            cleanup_lark()
+            _stop_watchdog()
+            return 0
+        else:
+            print("✗ 无法停止进程，请手动终止:")
+            print(f"  kill -9 {pid}")
+            return 1
+
+    except ProcessLookupError:
+        # 清理所有残留 lark_client 进程
+        stale = kill_all_lark_processes()
+        if stale:
+            print(f"  清理了 {len(stale)} 个残留进程: {stale}")
+        print("进程已不存在，清理残留文件")
+        cleanup_lark()
+        _stop_watchdog()
+        return 0
+    except Exception as e:
+        print(f"✗ 停止失败: {e}")
+        return 1
+
+
+def cmd_lark_restart(args):
+    """重启飞书客户端"""
+    print("正在重启飞书客户端...")
+
+    # 先停止
+    if is_lark_running():
+        cmd_lark_stop(args)
+        time.sleep(1)
+
+    # 再启动
+    return cmd_lark_start(args)
+
+
+def cmd_lark_status(args):
+    """显示飞书客户端状态"""
+    if not is_lark_running():
+        print("飞书客户端未运行")
+        print("\n使用 'python3 remote_claude.py lark start' 启动")
+        return 0
+
+    status = get_lark_status()
+    if status is None:
+        print("无法获取状态信息")
+        return 1
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("飞书客户端状态")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"状态:     运行中 ✓")
+    print(f"版本:     v{_VERSION}")
+    print(f"PID:      {status['pid']}")
+    print(f"启动时间: {status['start_time']}")
+    print(f"运行时长: {status['uptime']}")
+
+    # 检查日志文件
+    log_file = get_lark_log_file()
+    if log_file.exists():
+        print(f"日志文件: {log_file}")
+        print(f"日志大小: {log_file.stat().st_size / 1024:.1f} KB")
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # 显示最近的日志（最后 5 行）
+    if log_file.exists():
+        print("\n最近日志:")
+        print("-" * 40)
+        try:
+            with open(log_file, 'r') as f:
+                lines = f.readlines()
+                for line in lines[-5:]:
+                    print(f"  {line.rstrip()}")
+        except Exception as e:
+            print(f"  无法读取日志: {e}")
+        print("-" * 40)
+
+    return 0
+
+
+def cmd_stats(args):
+    """显示使用统计"""
+    _PROJECT_ROOT = str(Path(__file__).parent)
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+
+    from stats.query import query_summary, reset_stats
+    from stats import report_daily
+
+    if getattr(args, 'reset', False):
+        print(reset_stats())
+        return 0
+
+    if getattr(args, 'report', False):
+        report_daily()
+        return 0
+
+    range_str = getattr(args, 'range', 'today') or 'today'
+    session_name = getattr(args, 'session', '') or ''
+    detail = getattr(args, 'detail', False)
+
+    print(query_summary(range_str=range_str, session_name=session_name, detail=detail))
+    return 0
+
+
+def cmd_update(args):
+    """更新 remote-claude 到最新版本"""
+    import subprocess as _sp
+
+    git_dir = SCRIPT_DIR / ".git"
+    if git_dir.exists():
+        # 源码安装：git pull 更新
+        print(f"检测到源码安装（{SCRIPT_DIR}）")
+        print("正在更新...")
+        result = _sp.run(["git", "pull"], cwd=SCRIPT_DIR)
+        if result.returncode != 0:
+            print("❌ git pull 失败")
+            return 1
+        # 同步 Python 依赖
+        _sp.run(["uv", "sync"], cwd=SCRIPT_DIR)
+        print("✅ 更新完成")
+    else:
+        # npm 安装：区分本地和全局
+        install_dir_str = str(SCRIPT_DIR)
+        if "node_modules" in install_dir_str:
+            # 本地 npm 安装：找到项目根目录（node_modules 的上两级）
+            project_root = SCRIPT_DIR.parent.parent
+            print(f"检测到 npm 本地安装（{project_root}）")
+            print("正在更新...")
+            result = _sp.run(["npm", "install", "remote-claude@latest"], cwd=project_root)
+        else:
+            # 全局 npm 安装
+            print("检测到 npm 全局安装")
+            print("正在更新...")
+            result = _sp.run(["npm", "install", "-g", "remote-claude@latest"])
+        if result.returncode != 0:
+            print("❌ npm 更新失败")
+            return 1
+        print("✅ 更新完成，请重启终端使新版本生效")
+    return 0
+
+
+def cmd_deps(args):
+    """检查并安装依赖"""
+    import shutil
+
+    YELLOW = "\033[33m"
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    RESET = "\033[0m"
+
+    def print_ok(msg):
+        print(f"{GREEN}✓{RESET} {msg}")
+
+    def print_warn(msg):
+        print(f"{YELLOW}⚠{RESET} {msg}")
+
+    def print_err(msg):
+        print(f"{RED}✗{RESET} {msg}")
+
+    print(f"\n{GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}")
+    print(f"{GREEN}  依赖检查{RESET}")
+    print(f"{GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}\n")
+
+    # 检查 uv
+    uv_path = shutil.which("uv")
+    if uv_path:
+        r = subprocess.run(["uv", "--version"], capture_output=True, text=True)
+        print_ok(f"uv: {r.stdout.strip()}")
+    else:
+        print_err("uv: 未安装")
+
+    # 检查 claude CLI
+    claude_path = shutil.which("claude")
+    if claude_path:
+        print_ok("Claude CLI: 已安装")
+    else:
+        print_warn("Claude CLI: 未安装")
+
+    # 检查 codex CLI
+    codex_path = shutil.which("codex")
+    if codex_path:
+        print_ok("Codex CLI: 已安装")
+    else:
+        print_warn("Codex CLI: 未安装（可选）")
+
+    # 检查 tmux
+    REQUIRED_MAJOR = 3
+    REQUIRED_MINOR = 6
+
+    tmux_path = shutil.which("tmux")
+    tmux_ok = False
+    if tmux_path:
+        r = subprocess.run(["tmux", "-V"], capture_output=True, text=True)
+        ver_str = r.stdout.strip().split()[-1] if r.stdout.strip() else "0.0"
+        parts = ver_str.replace("a", "").replace("b", "").replace("c", "").split(".")
+        try:
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            major, minor = 0, 0
+        if major > REQUIRED_MAJOR or (major == REQUIRED_MAJOR and minor >= REQUIRED_MINOR):
+            print_ok(f"tmux: {r.stdout.strip()}（满足 >= {REQUIRED_MAJOR}.{REQUIRED_MINOR}）")
+            tmux_ok = True
+        else:
+            print_warn(f"tmux: {r.stdout.strip()}（需要 >= {REQUIRED_MAJOR}.{REQUIRED_MINOR}）")
+    else:
+        print_err("tmux: 未安装")
+
+    if tmux_ok:
+        print(f"\n{GREEN}所有关键依赖已满足。{RESET}")
+        return 0
+
+    # tmux 版本不满足，提供源码编译安装
+    print(f"\n{YELLOW}tmux 版本不满足要求，是否从源码编译安装 tmux 3.6a？{RESET}")
+    print(f"  安装位置: $HOME/.local（不需要 root 权限）")
+    print(f"  编译依赖安装可能需要 sudo 密码\n")
+
+    try:
+        answer = input("继续？[y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+
+    if answer not in ("y", "yes"):
+        print("已跳过 tmux 安装。")
+        return 0
+
+    # 安装编译依赖
+    print(f"\n{YELLOW}[1/4] 安装编译依赖...{RESET}")
+    os_name = os.uname().sysname
+    if os_name == "Darwin":
+        subprocess.run(["brew", "install", "libevent", "ncurses", "pkg-config", "bison"], check=False)
+    elif os_name == "Linux":
+        if shutil.which("apt-get"):
+            subprocess.run(["sudo", "apt-get", "update"], check=False)
+            subprocess.run(["sudo", "apt-get", "install", "-y",
+                          "build-essential", "libevent-dev", "libncurses5-dev",
+                          "libncursesw5-dev", "bison", "pkg-config"], check=False)
+        elif shutil.which("yum"):
+            subprocess.run(["sudo", "yum", "groupinstall", "-y", "Development Tools"], check=False)
+            subprocess.run(["sudo", "yum", "install", "-y",
+                          "libevent-devel", "ncurses-devel", "bison"], check=False)
+        else:
+            print_warn("无法识别包管理器，请手动安装编译依赖: libevent-dev ncurses-dev bison pkg-config")
+
+    # 下载源码
+    print(f"\n{YELLOW}[2/4] 下载 tmux 3.6a 源码...{RESET}")
+    import tempfile
+    tmpdir = tempfile.mkdtemp()
+    tarball = os.path.join(tmpdir, "tmux.tar.gz")
+    tmux_url = "https://github.com/tmux/tmux/releases/download/3.6a/tmux-3.6a.tar.gz"
+
+    r = subprocess.run(["curl", "-fsSL", tmux_url, "-o", tarball])
+    if r.returncode != 0:
+        print_err("下载失败，请检查网络连接。")
+        return 1
+
+    subprocess.run(["tar", "-xzf", tarball, "-C", tmpdir], check=True)
+    src_dir = os.path.join(tmpdir, "tmux-3.6a")
+
+    # 编译
+    prefix = os.path.join(os.path.expanduser("~"), ".local")
+    print(f"\n{YELLOW}[3/4] 编译 tmux（安装到 {prefix}）...{RESET}")
+
+    nproc = "2"
+    try:
+        r = subprocess.run(["nproc"], capture_output=True, text=True)
+        if r.returncode == 0:
+            nproc = r.stdout.strip()
+    except FileNotFoundError:
+        pass
+
+    r = subprocess.run(
+        f"./configure --prefix={prefix} && make -j{nproc} && make install",
+        shell=True, cwd=src_dir
+    )
+    if r.returncode != 0:
+        print_err("编译失败，请检查编译依赖是否已安装。")
+        return 1
+
+    # 清理临时目录
+    import shutil as _shutil
+    _shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 配置 PATH
+    print(f"\n{YELLOW}[4/4] 配置 PATH...{RESET}")
+    local_bin = os.path.join(prefix, "bin")
+    os.environ["PATH"] = f"{local_bin}:{os.environ.get('PATH', '')}"
+
+    if f"{local_bin}" not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{local_bin}:{os.environ['PATH']}"
+
+    # 写入 shell rc
+    shell_name = os.path.basename(os.environ.get("SHELL", "bash"))
+    rc_file = os.path.join(os.path.expanduser("~"), ".zshrc" if shell_name == "zsh" else ".bashrc")
+    path_line = 'export PATH="$HOME/.local/bin:$PATH"'
+    try:
+        rc_content = open(rc_file).read() if os.path.exists(rc_file) else ""
+        if "$HOME/.local/bin" not in rc_content:
+            with open(rc_file, "a") as f:
+                f.write(f"\n# remote-claude: tmux 路径\n{path_line}\n")
+            print_ok(f"已将 $HOME/.local/bin 写入 {rc_file}")
+    except Exception as e:
+        print_warn(f"无法写入 {rc_file}: {e}")
+
+    # 验证
+    tmux_bin = os.path.join(local_bin, "tmux")
+    if os.path.exists(tmux_bin):
+        r = subprocess.run([tmux_bin, "-V"], capture_output=True, text=True)
+        print(f"\n{GREEN}✓ tmux 安装成功: {r.stdout.strip()}{RESET}")
+        print(f"  路径: {tmux_bin}")
+        print(f"  请运行 source {rc_file} 或重新打开终端使 PATH 生效。")
+    else:
+        print_err("安装似乎未成功，请检查上方输出。")
+        return 1
+
+    return 0
+
+
+def cmd_lark_init(args):
+    """飞书机器人配置向导（扫码自动创建应用）"""
+    from lark_client.setup_wizard import SetupWizard
+    check_only = getattr(args, "check", False)
+    new_only = getattr(args, "new", False)
+    wizard = SetupWizard(check_only=check_only, new_only=new_only)
+    rc = wizard.run()
+    # 配置成功后自动重启飞书客户端（--check / --new 模式跳过）
+    if rc == 0 and not check_only and not new_only:
+        print("\n正在重启飞书客户端以应用新配置...")
+        cmd_lark_restart(args)
+    return rc
+
+
+def cmd_lark(args):
+    """飞书客户端管理（兼容旧命令）"""
+    # 如果没有子命令，默认显示状态或启动
+    if is_lark_running():
+        return cmd_lark_status(args)
+    else:
+        print("飞书客户端未运行")
+        print("\n可用命令:")
+        print("  python3 remote_claude.py lark init     - 配置向导（首次使用）")
+        print("  python3 remote_claude.py lark start    - 启动客户端")
+        print("  python3 remote_claude.py lark stop     - 停止客户端")
+        print("  python3 remote_claude.py lark restart  - 重启客户端")
+        print("  python3 remote_claude.py lark status   - 查看状态")
+        return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="IM Agent Bridge - 远程控制 Desktop AI Agent 与 CLI 会话",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  %(prog)s start mywork              启动名为 mywork 的会话
+  %(prog)s start mywork --cli codex  启动 codex 会话
+  %(prog)s attach mywork             连接到 mywork 会话
+  %(prog)s list                      列出所有会话
+  %(prog)s kill mywork               终止 mywork 会话
+  %(prog)s status mywork             显示 mywork 会话状态
+
+飞书客户端:
+  %(prog)s lark init                 配置向导（首次使用，扫码自动创建应用）
+  %(prog)s lark init --check         检查当前配置状态
+  %(prog)s lark init --new           扫码创建新应用（不修改已有配置）
+  %(prog)s lark start                启动飞书客户端
+  %(prog)s lark stop                 停止飞书客户端
+  %(prog)s lark restart              重启飞书客户端
+  %(prog)s lark status               查看飞书客户端状态
+
+终端控制:
+  Ctrl+D       断开连接
+
+飞书命令:
+  /attach <名称>   连接到会话
+  /detach          断开连接
+  /list            列出会话
+  /help            显示帮助
+
+使用统计:
+  %(prog)s stats                     今日概览
+  %(prog)s stats --range 7d          最近 7 天
+  %(prog)s stats --detail            详细分类
+  %(prog)s stats --session mywork    按会话筛选
+  %(prog)s stats --reset             清空数据
+
+更新:
+  %(prog)s update                    更新到最新版本
+
+依赖管理:
+  %(prog)s deps                      检查依赖并安装（含 tmux 源码编译）
+"""
+    )
+
+    parser.add_argument(
+        "--version", "-V",
+        action="version",
+        version=f"remote-claude v{_VERSION}",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="命令")
+
+    # start 命令
+    start_parser = subparsers.add_parser("start", help="启动新会话")
+    start_parser.add_argument("name", help="会话名称")
+    start_parser.add_argument(
+        "claude_args",
+        nargs="*",
+        help="传递给 Claude 的参数"
+    )
+    start_parser.add_argument(
+        "--debug-screen",
+        action="store_true",
+        help="开启 pyte 屏幕快照调试日志（每次 flush 写入 /tmp/remote-claude/<name>_screen.log）"
+    )
+    start_parser.add_argument(
+        "--debug-verbose",
+        action="store_true",
+        help="debug 日志输出完整诊断信息（indicator、repr 等），默认只输出 ansi_render"
+    )
+    start_parser.add_argument(
+        "--cli",
+        default="claude",
+        choices=["claude", "codex"],
+        help="后端 CLI 类型（默认 claude）"
+    )
+    start_parser.set_defaults(func=cmd_start)
+
+    # attach 命令
+    attach_parser = subparsers.add_parser("attach", help="连接到已有会话")
+    attach_parser.add_argument("name", help="会话名称")
+    attach_parser.set_defaults(func=cmd_attach)
+
+    # list 命令
+    list_parser = subparsers.add_parser("list", help="列出所有会话")
+    list_parser.set_defaults(func=cmd_list)
+
+    # kill 命令
+    kill_parser = subparsers.add_parser("kill", help="终止会话")
+    kill_parser.add_argument("name", help="会话名称或 PID")
+    kill_parser.set_defaults(func=cmd_kill)
+
+    # status 命令
+    status_parser = subparsers.add_parser("status", help="显示会话状态")
+    status_parser.add_argument("name", help="会话名称")
+    status_parser.set_defaults(func=cmd_status)
+
+    # lark 命令（带子命令）
+    lark_parser = subparsers.add_parser("lark", help="飞书客户端管理")
+    lark_subparsers = lark_parser.add_subparsers(dest="lark_command", help="飞书客户端操作")
+
+    # lark start
+    lark_start_parser = lark_subparsers.add_parser("start", help="启动飞书客户端")
+    lark_start_parser.set_defaults(func=cmd_lark_start)
+
+    # lark stop
+    lark_stop_parser = lark_subparsers.add_parser("stop", help="停止飞书客户端")
+    lark_stop_parser.set_defaults(func=cmd_lark_stop)
+
+    # lark restart
+    lark_restart_parser = lark_subparsers.add_parser("restart", help="重启飞书客户端")
+    lark_restart_parser.set_defaults(func=cmd_lark_restart)
+
+    # lark status
+    lark_status_parser = lark_subparsers.add_parser("status", help="查看飞书客户端状态")
+    lark_status_parser.set_defaults(func=cmd_lark_status)
+
+    # lark init
+    lark_init_parser = lark_subparsers.add_parser("init", help="配置向导（扫码自动创建应用）")
+    lark_init_group = lark_init_parser.add_mutually_exclusive_group()
+    lark_init_group.add_argument("--check", action="store_true", help="仅检查当前配置状态")
+    lark_init_group.add_argument("--new", action="store_true", help="扫码创建新应用（不修改已有配置）")
+    lark_init_parser.set_defaults(func=cmd_lark_init)
+
+    # 如果只输入 lark 没有子命令，使用默认处理
+    lark_parser.set_defaults(func=cmd_lark)
+
+    # stats 命令
+    stats_parser = subparsers.add_parser("stats", help="查看使用统计")
+    stats_parser.add_argument(
+        "--range", metavar="RANGE", default="today",
+        help="时间范围：today（默认）、7d、30d、90d"
+    )
+    stats_parser.add_argument(
+        "--detail", action="store_true",
+        help="显示详细分类"
+    )
+    stats_parser.add_argument(
+        "--session", metavar="NAME", default="",
+        help="按会话名筛选"
+    )
+    stats_parser.add_argument(
+        "--reset", action="store_true",
+        help="清空所有统计数据"
+    )
+    stats_parser.add_argument(
+        "--report", action="store_true",
+        help="立即触发 Mixpanel 聚合上报"
+    )
+    stats_parser.set_defaults(func=cmd_stats)
+
+    # update 命令
+    update_parser = subparsers.add_parser("update", help="更新 remote-claude 到最新版本")
+    update_parser.set_defaults(func=cmd_update)
+
+    # deps 命令
+    deps_parser = subparsers.add_parser("deps", help="检查并安装依赖（tmux 源码编译等）")
+    deps_parser.set_defaults(func=cmd_deps)
+
+    args, remaining = parser.parse_known_args()
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    # 将剩余参数合并到 claude_args（支持 cx/cdx 脚本中使用 -- 分隔符）
+    if args.command == "start" and hasattr(args, 'claude_args'):
+        args.claude_args = args.claude_args + remaining
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

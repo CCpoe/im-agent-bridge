@@ -1,0 +1,42 @@
+#!/bin/bash
+# 解析符号链接，兼容 macOS（不支持 readlink -f）
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+INSTALL_DIR="$(cd -P "$(dirname "$SOURCE")" && cd .. && pwd)"
+
+# uv 路径兜底
+if ! command -v uv &>/dev/null; then
+    [ -f "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# log 子命令：查看最后启动的 session 日志
+if [ "$1" = "log" ]; then
+    LOG_DIR="/tmp/remote-claude"
+    if [ -n "$2" ]; then
+        # 指定 session 名，/ . 空格替换为 _（与 _log_filename 一致）
+        SESSION_LOG=$(echo "$2" | tr '/. ' '___')
+        LOG_FILE="$LOG_DIR/${SESSION_LOG}_messages.log"
+    else
+        # 找最后启动的 session（按 .name 文件修改时间排序）
+        LATEST_NAME=$(ls -t "$LOG_DIR"/*.name 2>/dev/null | head -1)
+        if [ -n "$LATEST_NAME" ]; then
+            SESSION_NAME=$(cat "$LATEST_NAME" 2>/dev/null)
+            SESSION_LOG=$(echo "$SESSION_NAME" | tr '/. ' '___')
+            LOG_FILE="$LOG_DIR/${SESSION_LOG}_messages.log"
+        fi
+    fi
+
+    if [ -z "$LOG_FILE" ] || [ ! -f "$LOG_FILE" ]; then
+        echo "没有找到日志文件（请先启动一个会话）" >&2
+        exit 1
+    fi
+
+    echo "📄 $LOG_FILE"
+    exec tail -50f "$LOG_FILE"
+fi
+
+exec uv run --project "$INSTALL_DIR" python3 "$INSTALL_DIR/remote_claude.py" "$@"

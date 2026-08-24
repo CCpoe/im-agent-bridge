@@ -1,0 +1,59 @@
+{
+  "name": "remote-claude",
+  "version": "1.1.1",
+  "description": "Control Codex, Claude, and other desktop AI agents remotely from Lark and messaging platforms.",
+  "bin": {
+    "remote-claude": "bin/remote-claude",
+    "cla": "bin/cla",
+    "cl": "bin/cl"
+  },
+  "scripts": {
+    "preinstall": "bash scripts/preinstall.sh",
+    "postinstall": "bash scripts/postinstall.sh"
+  },
+  "files": [
+    "bin/",
+    "scripts/*.sh",
+    "scripts/*.py",
+    "init.sh",
+    "remote_claude.py",
+    "server/*.py",
+    "server/parsers/*.py",
+    "client/*.py",
+    "utils/*.py",
+    "lark_client/__init__.py",
+    "lark_client/*.py",
+    "stats/__init__.py",
+    "stats/*.py",
+    "pyproject.toml",
+    ".env.example"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CCpoe/im-agent-bridge.git"
+  },
+  "homepage": "https://github.com/CCpoe/im-agent-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/CCpoe/im-agent-bridge/issues"
+  },
+  "keywords": [
+    "agent",
+    "desktop",
+    "claude",
+    "cli",
+    "terminal",
+    "pty",
+    "lark"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
+}

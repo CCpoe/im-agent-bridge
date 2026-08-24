@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+test-results/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# 环境配置（含密钥）
+.env
+
+# 日志和临时文件
+*.log
+*.tmp
+
+# macOS
+.DS_Store
+
+# Remote Claude 运行时文件
+/tmp/remote-claude/
+*.sock
+*.pid
+*.status
+lark_client.log
+
+# 测试输出
+test_output/
+capture_*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# npm
+node_modules/
+
+# uv 锁文件（含内网 PyPI 地址，不提交）
+uv.lock
