@@ -94,6 +94,7 @@ class LarkHandler:
         # Codex Desktop owner/follower IPC 桥接（延迟连接）
         self._desktop = DesktopBridgeManager(card_service)
         self._desktop_start_task: Optional[asyncio.Task] = None
+        self._desktop_attaching_chats: set[str] = set()
         self._processed_message_ids: Dict[str, float] = {}
         logger.info(
             f"LarkHandler 初始化: bindings={len(self._chat_bindings)}, "
@@ -469,6 +470,28 @@ class LarkHandler:
             await self._cmd_desktop_list(user_id, chat_id, message_id=message_id)
             return
 
+        attaching = getattr(self, "_desktop_attaching_chats", None)
+        if attaching is None:
+            attaching = self._desktop_attaching_chats = set()
+        if chat_id in attaching:
+            return
+        attaching.add(chat_id)
+        try:
+            await self._cmd_desktop_attach_once(
+                user_id, chat_id, thread_id, message_id=message_id
+            )
+        finally:
+            attaching.discard(chat_id)
+
+    async def _cmd_desktop_attach_once(
+        self,
+        user_id: str,
+        chat_id: str,
+        thread_id: str,
+        message_id: Optional[str] = None,
+    ):
+        """Attach once, loading an unloaded macOS Desktop task when needed."""
+
         await self._desktop.register_notification_target(user_id)
         if self._desktop.is_archived_thread(thread_id):
             if not await self._desktop.unarchive_thread(thread_id):
@@ -478,19 +501,32 @@ class LarkHandler:
                 return
 
         had_cli_binding = chat_id in self._bridges or chat_id in self._chat_sessions
-        ok = await self._desktop.attach(chat_id, user_id, thread_id)
+        attach_kwargs = {"owner_timeout": 0.75} if sys.platform == "darwin" else {}
+        ok = await self._desktop.attach(
+            chat_id, user_id, thread_id, **attach_kwargs
+        )
         if not ok and sys.platform == "darwin":
             clean_id = thread_id.removeprefix("codex://threads/").strip()
             if clean_id and "/" not in clean_id:
                 try:
                     subprocess.Popen(
-                        ["open", f"codex://threads/{clean_id}"],
+                        [
+                            "open",
+                            "-b",
+                            "com.openai.codex",
+                            f"codex://threads/{clean_id}",
+                        ],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    for delay in (0.5, 1.0, 2.0):
+                    for delay in (1.0, 2.0, 4.0, 8.0):
                         await asyncio.sleep(delay)
-                        ok = await self._desktop.attach(chat_id, user_id, clean_id)
+                        ok = await self._desktop.attach(
+                            chat_id,
+                            user_id,
+                            clean_id,
+                            owner_timeout=0.75,
+                        )
                         if ok:
                             break
                 except Exception:

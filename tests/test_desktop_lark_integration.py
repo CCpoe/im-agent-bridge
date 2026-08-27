@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,6 +21,7 @@ class FakeDesktop:
         self.archived = False
         self.unarchived = []
         self.turn_pages = []
+        self.attach_kwargs = []
 
     async def start(self):
         self.started = True
@@ -61,9 +63,10 @@ class FakeDesktop:
         self.sent.append((chat_id, text, client_message_id))
         return True
 
-    async def attach(self, chat_id, user_id, thread_id):
+    async def attach(self, chat_id, user_id, thread_id, **kwargs):
         self.attached = True
         self.attached_threads.append((chat_id, user_id, thread_id))
+        self.attach_kwargs.append(kwargs)
         return True
 
     async def detach(self, chat_id):
@@ -82,6 +85,7 @@ def make_handler(desktop):
     handler = LarkHandler.__new__(LarkHandler)
     handler._desktop = desktop
     handler._desktop_start_task = None
+    handler._desktop_attaching_chats = set()
     handler._health_check_task = MagicMock()
     handler._health_check_task.done.return_value = False
     handler._bridges = {}
@@ -182,9 +186,9 @@ async def test_archived_session_is_unarchived_before_attach(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_desktop_attach_retries_three_times_after_cold_start(monkeypatch):
+async def test_desktop_attach_loads_cold_task_with_bundle_id_and_retries(monkeypatch):
     desktop = FakeDesktop()
-    desktop.attach = AsyncMock(side_effect=[False, False, False, True])
+    desktop.attach = AsyncMock(side_effect=[False, False, True])
     handler = make_handler(desktop)
     popen = MagicMock()
     sleep = AsyncMock()
@@ -194,15 +198,52 @@ async def test_desktop_attach_retries_three_times_after_cold_start(monkeypatch):
 
     await handler._cmd_desktop_attach("user-1", "chat-1", "thread-cold")
 
-    assert desktop.attach.await_count == 4
+    assert desktop.attach.await_count == 3
     assert [call.args for call in desktop.attach.await_args_list] == [
         ("chat-1", "user-1", "thread-cold"),
         ("chat-1", "user-1", "thread-cold"),
         ("chat-1", "user-1", "thread-cold"),
-        ("chat-1", "user-1", "thread-cold"),
     ]
-    assert [call.args[0] for call in sleep.await_args_list] == [0.5, 1.0, 2.0]
-    popen.assert_called_once()
+    assert [call.kwargs for call in desktop.attach.await_args_list] == [
+        {"owner_timeout": 0.75},
+        {"owner_timeout": 0.75},
+        {"owner_timeout": 0.75},
+    ]
+    assert [call.args[0] for call in sleep.await_args_list] == [1.0, 2.0]
+    popen.assert_called_once_with(
+        [
+            "open",
+            "-b",
+            "com.openai.codex",
+            "codex://threads/thread-cold",
+        ],
+        stdout=handler_module.subprocess.DEVNULL,
+        stderr=handler_module.subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_desktop_attach_is_ignored_while_first_is_running():
+    desktop = FakeDesktop()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_attach(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return True
+
+    desktop.attach = AsyncMock(side_effect=slow_attach)
+    handler = make_handler(desktop)
+    first = asyncio.create_task(
+        handler._cmd_desktop_attach("user-1", "chat-1", "thread-1")
+    )
+    await entered.wait()
+    await handler._cmd_desktop_attach("user-1", "chat-1", "thread-1")
+    release.set()
+    await first
+
+    assert desktop.attach.await_count == 1
 
 
 @pytest.mark.asyncio

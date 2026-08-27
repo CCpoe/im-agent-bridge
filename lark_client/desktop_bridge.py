@@ -165,7 +165,14 @@ class DesktopBridgeManager:
 
     # -- 绑定 ----------------------------------------------------------
 
-    async def attach(self, chat_id: str, user_id: str, thread_id: str) -> bool:
+    async def attach(
+        self,
+        chat_id: str,
+        user_id: str,
+        thread_id: str,
+        *,
+        owner_timeout: Optional[float] = None,
+    ) -> bool:
         chat_id = str(chat_id).strip()
         thread_id = _clean_thread_id(thread_id)
         if not chat_id or not thread_id:
@@ -177,9 +184,21 @@ class DesktopBridgeManager:
 
         previous = self._bindings.get(chat_id)
         try:
-            owner = await self.ipc.discover_owner(thread_id)
+            if owner_timeout is None:
+                owner = await self.ipc.discover_owner(thread_id)
+            else:
+                owner = await self.ipc.discover_owner(
+                    thread_id, timeout=owner_timeout
+                )
         except Exception:
-            logger.exception("无法将聊天 %s 绑定到 Desktop 线程 %s", chat_id, thread_id)
+            if owner_timeout is None:
+                logger.exception(
+                    "无法将聊天 %s 绑定到 Desktop 线程 %s", chat_id, thread_id
+                )
+            else:
+                logger.debug(
+                    "Desktop 线程尚未加载: %s", thread_id, exc_info=True
+                )
             return False
 
         # follow 可能立即触发 snapshot，先建立内存绑定才能接住该事件。
