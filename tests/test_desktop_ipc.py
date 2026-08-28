@@ -22,6 +22,7 @@ from lark_client.desktop_ipc import (
     METHOD_SUBMIT_USER_INPUT,
     THREAD_INTERRUPT_VERSION,
     THREAD_INTERRUPT_LEGACY_VERSION,
+    THREAD_START_VERSION,
     encode_frame,
     read_frame,
 )
@@ -237,15 +238,23 @@ async def test_owner_follow_start_and_steer_wire_protocol(monkeypatch):
         "version": 1,
     }
 
-    await client.start_turn("thread-1", "开始处理")
+    await client.start_turn(
+        "thread-1", "开始处理", client_user_message_id="start-message-id"
+    )
     start = peer.requests(METHOD_START_TURN)[0]
+    assert start["version"] == THREAD_START_VERSION == 2
     assert start["targetClientId"] == "desktop-owner"
     assert start["params"] == {
         "conversationId": "thread-1",
-        "turnStartParams": {
-            "input": [
-                {"type": "text", "text": "开始处理", "text_elements": []}
-            ]
+        "turnStart": {
+            "request": {
+                "threadId": "thread-1",
+                "clientUserMessageId": "start-message-id",
+                "input": [
+                    {"type": "text", "text": "开始处理", "text_elements": []}
+                ],
+            },
+            "context": {"inheritThreadSettings": True},
         },
     }
 
@@ -271,6 +280,44 @@ async def test_owner_follow_start_and_steer_wire_protocol(monkeypatch):
     assert params["restoreMessage"]["context"]["workspaceRoots"] == [
         "/workspace"
     ]
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_start_turn_falls_back_to_legacy_v1_after_v2_version_rejection():
+    peer = FakePeer(auto_respond=False)
+    client = make_client(peer)
+    connect_task = asyncio.create_task(client.connect())
+    await asyncio.sleep(0.01)
+    initialize = peer.requests("initialize")[0]
+    peer.respond(initialize, result={"clientId": "sidecar-1"}, handled_by="broker")
+    await connect_task
+
+    task = asyncio.create_task(client.start_turn("thread-1", "legacy"))
+    await asyncio.sleep(0.01)
+    discovery = peer.requests(METHOD_OWNER_DISCOVERY)[0]
+    peer.respond(discovery, result={}, handled_by="legacy-owner")
+
+    for _ in range(2):
+        await asyncio.sleep(0.01)
+        request = peer.requests(METHOD_START_TURN)[-1]
+        assert request["version"] == 2
+        peer.respond(request, result_type="error", error="no-client-found")
+        await asyncio.sleep(0.01)
+        discovery = peer.requests(METHOD_OWNER_DISCOVERY)[-1]
+        peer.respond(discovery, result={}, handled_by="legacy-owner")
+
+    await asyncio.sleep(0.01)
+    legacy = peer.requests(METHOD_START_TURN)[-1]
+    assert legacy["version"] == 1
+    assert legacy["params"] == {
+        "conversationId": "thread-1",
+        "turnStartParams": {
+            "input": [{"type": "text", "text": "legacy", "text_elements": []}],
+        },
+    }
+    peer.respond(legacy, result={"ok": True}, handled_by="legacy-owner")
+    assert await task == {"ok": True}
     await client.disconnect()
 
 

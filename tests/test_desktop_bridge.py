@@ -57,7 +57,12 @@ class FakeIPC:
     async def steer_turn(self, thread_id, text, cwd, client_user_message_id=None):
         self.calls.append(("steer", thread_id, text, cwd, client_user_message_id))
         if self.steer_error:
-            raise DesktopIPCRemoteError("thread-follower-steer-turn", "no active turn")
+            error = (
+                self.steer_error
+                if isinstance(self.steer_error, str)
+                else "no active turn"
+            )
+            raise DesktopIPCRemoteError("thread-follower-steer-turn", error)
 
     async def interrupt(self, thread_id, expected_turn_id=None):
         self.calls.append(("interrupt", thread_id, expected_turn_id))
@@ -1113,6 +1118,39 @@ async def test_duplicate_client_message_id_is_sent_once(tmp_path):
 
     steer_calls = [call for call in ipc.calls if call[0] == "steer"]
     assert len(steer_calls) == 1
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_thread_starts_after_explicit_inactive_steer(tmp_path):
+    ipc = FakeIPC()
+    bridge = manager(tmp_path, ipc)
+    assert await bridge.attach("chat-1", "user-1", "thread-1")
+    await ipc.emit(snapshot(status="completed"))
+    ipc.steer_error = "NoActiveTurn"
+
+    assert await bridge.send_message("chat-1", "下一轮")
+
+    assert any(call[0:3] == ("start", "thread-1", "下一轮") for call in ipc.calls)
+    assert any(call[0] == "steer" for call in ipc.calls)
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_inactive_steer_falls_back_to_start_but_other_errors_do_not(tmp_path):
+    ipc = FakeIPC()
+    bridge = manager(tmp_path, ipc)
+    assert await bridge.attach("chat-1", "user-1", "thread-1")
+    await ipc.emit(snapshot(status="inProgress"))
+
+    ipc.steer_error = "active turn already ended"
+    assert await bridge.send_message("chat-1", "新一轮")
+    assert any(call[0:3] == ("start", "thread-1", "新一轮") for call in ipc.calls)
+
+    ipc.calls.clear()
+    ipc.steer_error = "permission denied"
+    assert not await bridge.send_message("chat-1", "不要降级")
+    assert not any(call[0] == "start" for call in ipc.calls)
     await bridge.close()
 
 

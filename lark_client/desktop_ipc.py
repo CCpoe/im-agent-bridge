@@ -33,6 +33,7 @@ DEFAULT_HOST_ID = "local"
 
 INITIALIZE_VERSION = 0
 THREAD_REQUEST_VERSION = 1
+THREAD_START_VERSION = 2
 THREAD_STATE_VERSION = 11
 THREAD_INTERRUPT_LEGACY_VERSION = 3
 THREAD_INTERRUPT_VERSION = 4
@@ -501,21 +502,50 @@ class DesktopIPCClient:
     ) -> Any:
         """在空闲 Desktop 线程中开始一个 turn。"""
 
-        turn_params = dict(turn_start_params or {})
-        turn_params.setdefault("input", [self._text_input(prompt)])
+        turn_request = dict(turn_start_params or {})
+        turn_request.setdefault("threadId", conversation_id)
+        turn_request.setdefault("input", [self._text_input(prompt)])
         if client_user_message_id:
-            turn_params.setdefault("clientUserMessageId", client_user_message_id)
-        return await self._owner_request(
-            METHOD_START_TURN,
-            conversation_id,
-            {
-                "conversationId": conversation_id,
-                "turnStartParams": turn_params,
-            },
-            owner_client_id=owner_client_id,
-            host_id=host_id,
-            timeout=timeout,
-        )
+            turn_request.setdefault("clientUserMessageId", client_user_message_id)
+        try:
+            return await self._owner_request(
+                METHOD_START_TURN,
+                conversation_id,
+                {
+                    "conversationId": conversation_id,
+                    "turnStart": {
+                        "request": turn_request,
+                        "context": {"inheritThreadSettings": True},
+                    },
+                },
+                owner_client_id=owner_client_id,
+                host_id=host_id,
+                timeout=timeout,
+                version=THREAD_START_VERSION,
+            )
+        except DesktopIPCRemoteError as exc:
+            # Desktop <= 26.814 used v1 + turnStartParams.  A v2 request is
+            # rejected during client discovery as no-client-found, so retrying
+            # the legacy shape is safe: no owner accepted the first request.
+            error_text = str(exc.error).lower()
+            if "no-client-found" not in error_text and "version-mismatch" not in error_text:
+                raise
+            legacy_params = dict(turn_start_params or {})
+            legacy_params.setdefault("input", [self._text_input(prompt)])
+            if client_user_message_id:
+                legacy_params.setdefault("clientUserMessageId", client_user_message_id)
+            return await self._owner_request(
+                METHOD_START_TURN,
+                conversation_id,
+                {
+                    "conversationId": conversation_id,
+                    "turnStartParams": legacy_params,
+                },
+                owner_client_id=owner_client_id,
+                host_id=host_id,
+                timeout=timeout,
+                version=THREAD_REQUEST_VERSION,
+            )
 
     async def steer_turn(
         self,

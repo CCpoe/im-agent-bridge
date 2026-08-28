@@ -931,13 +931,18 @@ class DesktopBridgeManager:
                         await self._return_to_latest_turn(chat_id, thread_id)
                     return accepted
                 try:
+                    # Follow Desktop's own follow-up behavior: attempt steer
+                    # first because the cached status can lag a just-started
+                    # turn, then start only after an explicit inactive error.
                     await self.ipc.steer_turn(
                         thread_id,
                         text,
                         self._cwd_for_thread(thread_id),
                         client_user_message_id=client_message_id,
                     )
-                except DesktopIPCRemoteError:
+                except DesktopIPCRemoteError as exc:
+                    if not _steer_requires_new_turn(exc):
+                        raise
                     await self.ipc.start_turn(
                         thread_id,
                         text,
@@ -1514,6 +1519,19 @@ def _list_status(value: Any) -> str:
     if value in {"failed", "systemError"}:
         return "failed"
     return "idle"
+
+
+def _steer_requires_new_turn(error: DesktopIPCRemoteError) -> bool:
+    """Return true only when Desktop explicitly says the active turn ended."""
+
+    text = str(error.error).lower()
+    return any(marker in text for marker in (
+        "active turn already ended",
+        "no active turn",
+        "noactiveturn",
+        "steerturninactive",
+        "turn is not active",
+    ))
 
 
 def _rollout_record_status(raw_line: Any) -> Optional[str]:
