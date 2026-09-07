@@ -11,6 +11,8 @@ import pytest
 from lark_client.desktop_notifications import (
     DesktopCompletionMonitor,
     _complete_file_offset,
+    _completion_source_eligibility,
+    _is_subagent_metadata,
 )
 from lark_client.card_service import CardService, CardState
 
@@ -35,12 +37,141 @@ def _line(payload):
     }, separators=(",", ":")) + "\n"
 
 
+def _metadata(thread_id="thread-1", **overrides):
+    return json.dumps({
+        "type": "session_meta",
+        "payload": {
+            "id": thread_id,
+            "session_id": thread_id,
+            "originator": "Codex Desktop",
+            "source": "vscode",
+            **overrides,
+        },
+    }, separators=(",", ":")) + "\n"
+
+
+@pytest.mark.parametrize("metadata", [
+    {"_is_child": True},
+    {"parent_thread_id": "root-1"},
+    {"parentThreadId": "root-1"},
+    {"thread_source": "subagent"},
+    {"threadSource": "subagent"},
+    {"source": "subagent"},
+    {"source": "SUBAGENT"},
+    {"source": "subAgentThreadSpawn"},
+    {"source": json.dumps("subAgentThreadSpawn")},
+    {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "root-1"}}}},
+    {"source": json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": "root-1"}}})},
+])
+def test_subagent_detection_uses_structured_ownership_metadata(metadata):
+    assert _is_subagent_metadata(metadata)
+
+
+@pytest.mark.parametrize("metadata", [
+    {},
+    {"source": "vscode"},
+    {"source": "appServer", "parent_thread_id": None},
+    {"title": "subagent completed", "source": {"note": "subagent"}},
+    {"source": "{malformed"},
+])
+def test_subagent_detection_does_not_guess_from_title_or_unrelated_text(metadata):
+    assert not _is_subagent_metadata(metadata)
+
+
+@pytest.mark.parametrize("metadata", [
+    {"parent_thread_id": "thread-1"},
+    {"thread_source": "subagent"},
+    {"source": "subAgentThreadSpawn"},
+    {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "thread-1"}}}},
+    {"source": json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": "thread-1"}}})},
+])
+@pytest.mark.asyncio
+async def test_monitor_only_notifies_root_after_child_completion(tmp_path, metadata):
+    root = tmp_path / "root.jsonl"
+    child = tmp_path / "child.jsonl"
+    root.write_text(_metadata())
+    child.write_text(_metadata("child-1", session_id="thread-1", **metadata))
+    sources = lambda: [
+        {"thread_id": "thread-1", "_rollout_path": str(root)},
+        {"thread_id": "child-1", "_rollout_path": str(child)},
+    ]
+    cards = FakeCardService()
+    monitor = DesktopCompletionMonitor(
+        cards, sources, state_path=tmp_path / "notifications.json"
+    )
+    await monitor.register_target("user-1")
+    with child.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "child-turn"}))
+    with root.open("a") as target:
+        target.write(_line({
+            "type": "item_completed",
+            "thread_id": "thread-1",
+            "turn_id": "root-turn",
+            "item": {
+                "type": "SubAgentActivity", "kind": "completed",
+                "agent_thread_id": "child-1", "agent_path": "/root/review",
+            },
+        }))
+    assert await monitor.poll_once() == 0
+    assert cards.calls == []
+    assert "child-1" not in monitor._cursors
+
+    with root.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "root-turn"}))
+    assert await monitor.poll_once() == 1
+    assert len(cards.calls) == 1
+    assert "child-1" not in json.dumps(cards.calls[0][1])
+
+
+@pytest.mark.asyncio
+async def test_monitor_rejects_child_rollout_reusing_root_session_id_without_other_flags(tmp_path):
+    child = tmp_path / "child.jsonl"
+    child.write_text(_metadata("child-1", session_id="thread-1"))
+    sources = lambda: [{"thread_id": "thread-1", "_rollout_path": str(child)}]
+    cards = FakeCardService()
+    monitor = DesktopCompletionMonitor(
+        cards, sources, state_path=tmp_path / "notifications.json"
+    )
+    await monitor.register_target("user-1")
+    with child.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "child-turn"}))
+
+    assert await monitor.poll_once() == 0
+    assert cards.calls == []
+    assert monitor._cursors == {}
+
+
+def test_completion_eligibility_accepts_legacy_root_session_id(tmp_path):
+    rollout = tmp_path / "legacy.jsonl"
+    rollout.write_text(_metadata(id=None))
+    source = {"thread_id": "thread-1", "_rollout_path": str(rollout)}
+
+    assert _completion_source_eligibility(source) is True
+    rollout.write_text(_metadata(id=None, source={"subagent": "review"}))
+    assert _completion_source_eligibility(source) is False
+
+
+@pytest.mark.parametrize("contents", [
+    "",
+    '{"type":"session_meta","payload":',
+    "{invalid}\n",
+    _line({"type": "task_complete", "turn_id": "unattributed"}),
+])
+def test_completion_eligibility_defers_unverifiable_source(tmp_path, contents):
+    rollout = tmp_path / "unknown.jsonl"
+    rollout.write_text(contents)
+
+    assert _completion_source_eligibility({
+        "thread_id": "thread-1", "_rollout_path": str(rollout),
+    }) is None
+
+
 @pytest.mark.asyncio
 async def test_first_registration_uses_pre_snapshot_cutoff_but_activates_afterward(
     tmp_path, monkeypatch
 ):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_complete", "turn_id": "old"}))
+    rollout.write_text(_metadata() + _line({"type": "task_complete", "turn_id": "old"}))
     sources = lambda: [{
             "thread_id": "thread-1",
             "_rollout_path": str(rollout),
@@ -74,7 +205,7 @@ async def test_first_registration_uses_pre_snapshot_cutoff_but_activates_afterwa
 @pytest.mark.asyncio
 async def test_completion_written_before_file_stat_is_not_lost(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_complete", "turn_id": "old"}))
+    rollout.write_text(_metadata() + _line({"type": "task_complete", "turn_id": "old"}))
     time.sleep(0.01)
     cards = FakeCardService()
     wrote_during_snapshot = False
@@ -124,7 +255,7 @@ def test_complete_file_offset_uses_the_supplied_size_boundary(tmp_path):
 @pytest.mark.asyncio
 async def test_monitor_skips_history_then_notifies_each_new_completion(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_complete", "turn_id": "old"}))
+    rollout.write_text(_metadata() + _line({"type": "task_complete", "turn_id": "old"}))
     sources = lambda: [{
         "thread_id": "thread-1",
         "title": "任务一",
@@ -178,7 +309,7 @@ async def test_monitor_skips_history_then_notifies_each_new_completion(tmp_path)
 @pytest.mark.asyncio
 async def test_monitor_retries_failed_delivery_without_duplicate_success(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_started", "turn_id": "turn-1"}))
+    rollout.write_text(_metadata() + _line({"type": "task_started", "turn_id": "turn-1"}))
     sources = lambda: [{
         "thread_id": "thread-1",
         "title": "任务一",
@@ -195,6 +326,8 @@ async def test_monitor_retries_failed_delivery_without_duplicate_success(tmp_pat
 
     assert await monitor.poll_once() == 0
     pending = next(iter(monitor._pending.values()))
+    assert pending["source_path"] == str(rollout)
+    assert pending["source_thread_id"] == "thread-1"
     pending["next_attempt_at"] = 0
     assert await monitor.poll_once() == 1
     assert len(cards.calls) == 2
@@ -205,7 +338,7 @@ async def test_monitor_retries_failed_delivery_without_duplicate_success(tmp_pat
 @pytest.mark.asyncio
 async def test_monitor_replays_persisted_pending_delivery_after_restart(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_started", "turn_id": "turn-1"}))
+    rollout.write_text(_metadata() + _line({"type": "task_started", "turn_id": "turn-1"}))
     sources = lambda: [{
         "thread_id": "thread-1",
         "title": "任务一",
@@ -235,10 +368,168 @@ async def test_monitor_replays_persisted_pending_delivery_after_restart(tmp_path
     assert restarted._pending == {}
 
 
+@pytest.mark.parametrize("restore_root_source", [False, True])
+@pytest.mark.asyncio
+async def test_monitor_discards_persisted_child_outbox_after_restart(tmp_path, restore_root_source):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_metadata())
+    sources = lambda: [{"thread_id": "thread-1", "_rollout_path": str(rollout)}]
+    state_path = tmp_path / "notifications.json"
+    first = DesktopCompletionMonitor(FakeCardService([None]), sources, state_path=state_path)
+    await first.register_target("user-1")
+    with rollout.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "legacy-child-turn"}))
+    assert await first.poll_once() == 0
+    assert first._pending
+    for pending in first._pending.values():
+        pending.pop("source_path", None)
+        pending.pop("source_thread_id", None)
+    first._save_state()
+
+    # 模拟旧版本误把复用根 session_id 的子 rollout 作为根通知来源入箱。
+    rollout.write_text(_metadata(
+        "child-1", session_id="thread-1",
+        source={"subagent": {"thread_spawn": {"parent_thread_id": "thread-1"}}},
+    ))
+    root = tmp_path / "real-root.jsonl"
+    root.write_text(_metadata())
+    current_sources = (
+        [{"thread_id": "thread-1", "_rollout_path": str(root)}]
+        if restore_root_source else []
+    )
+    cards = FakeCardService()
+    restarted = DesktopCompletionMonitor(cards, lambda: current_sources, state_path=state_path)
+    next(iter(restarted._pending.values()))["next_attempt_at"] = 0
+    assert await restarted.poll_once() == 0
+    assert restarted._pending == {}
+    assert cards.calls == []
+    assert json.loads(state_path.read_text())["pending"] == {}
+
+
+@pytest.mark.asyncio
+async def test_verified_pending_recovers_after_root_moves_to_archive(tmp_path):
+    rollout = tmp_path / "root.jsonl"
+    archived = tmp_path / "archived-root.jsonl"
+    rollout.write_text(_metadata())
+    sources = lambda: [{"thread_id": "thread-1", "_rollout_path": str(rollout)}]
+    state_path = tmp_path / "notifications.json"
+    first = DesktopCompletionMonitor(FakeCardService([None]), sources, state_path=state_path)
+    await first.register_target("user-1")
+    with rollout.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "root-turn"}))
+    assert await first.poll_once() == 0
+    rollout.rename(archived)
+
+    cards = FakeCardService()
+    restarted = DesktopCompletionMonitor(cards, lambda: [{
+        "thread_id": "thread-1", "_rollout_path": str(archived),
+    }], state_path=state_path)
+    pending = next(iter(restarted._pending.values()))
+    pending["next_attempt_at"] = 0
+    assert await restarted.poll_once() == 1
+    assert len(cards.calls) == 1
+    assert pending["source_path"] == str(rollout)
+    assert restarted._pending == {}
+
+
+@pytest.mark.parametrize("keep_old_cursor", [False, True])
+@pytest.mark.asyncio
+async def test_unverified_legacy_pending_cannot_borrow_restored_root_source(tmp_path, keep_old_cursor):
+    rollout = tmp_path / "old-source.jsonl"
+    restored = tmp_path / "restored-root.jsonl"
+    rollout.write_text(_metadata())
+    sources = lambda: [{"thread_id": "thread-1", "_rollout_path": str(rollout)}]
+    state_path = tmp_path / "notifications.json"
+    first = DesktopCompletionMonitor(FakeCardService([None]), sources, state_path=state_path)
+    await first.register_target("user-1")
+    with rollout.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "old-turn"}))
+    assert await first.poll_once() == 0
+    for pending in first._pending.values():
+        pending.pop("source_path", None)
+        pending.pop("source_thread_id", None)
+    if not keep_old_cursor:
+        first._cursors.clear()
+    first._save_state()
+    rollout.rename(restored)
+
+    cards = FakeCardService()
+    restarted = DesktopCompletionMonitor(cards, lambda: [{
+        "thread_id": "thread-1", "_rollout_path": str(restored),
+    }], state_path=state_path)
+    pending = next(iter(restarted._pending.values()))
+    pending["next_attempt_at"] = 0
+    assert await restarted.poll_once() == 0
+    assert await restarted.poll_once() == 0
+    assert restarted._pending
+    assert pending["source_path"] == (str(rollout) if keep_old_cursor else None)
+    assert "source_thread_id" not in pending
+    assert cards.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_can_verify_original_root_before_later_move(tmp_path):
+    rollout = tmp_path / "root.jsonl"
+    archived = tmp_path / "archived-root.jsonl"
+    rollout.write_text(_metadata())
+    source_path = [rollout]
+    sources = lambda: [{"thread_id": "thread-1", "_rollout_path": str(source_path[0])}]
+    state_path = tmp_path / "notifications.json"
+    first = DesktopCompletionMonitor(FakeCardService([None]), sources, state_path=state_path)
+    await first.register_target("user-1")
+    with rollout.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "root-turn"}))
+    assert await first.poll_once() == 0
+    for pending in first._pending.values():
+        pending.pop("source_path", None)
+        pending.pop("source_thread_id", None)
+    first._save_state()
+
+    cards = FakeCardService([None, "archived-delivery"])
+    restarted = DesktopCompletionMonitor(cards, sources, state_path=state_path)
+    pending = next(iter(restarted._pending.values()))
+    pending["next_attempt_at"] = 0
+    assert await restarted.poll_once() == 0
+    assert pending["source_thread_id"] == "thread-1"
+    rollout.rename(archived)
+    source_path[0] = archived
+    pending["next_attempt_at"] = 0
+    assert await restarted.poll_once() == 1
+    assert pending["source_path"] == str(rollout)
+    assert len(cards.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_monitor_preserves_pending_when_metadata_unreadable_and_retries_on_recovery(tmp_path):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_metadata())
+    sources = lambda: [{"thread_id": "thread-1", "_rollout_path": str(rollout)}]
+    state_path = tmp_path / "notifications.json"
+    first = DesktopCompletionMonitor(FakeCardService([None]), sources, state_path=state_path)
+    await first.register_target("user-1")
+    with rollout.open("a") as target:
+        target.write(_line({"type": "task_complete", "turn_id": "root-turn"}))
+    assert await first.poll_once() == 0
+    saved_contents = rollout.read_text()
+    rollout.write_text('{"type":"session_meta","payload":')
+    cards = FakeCardService()
+    restarted = DesktopCompletionMonitor(cards, sources, state_path=state_path)
+    next(iter(restarted._pending.values()))["next_attempt_at"] = 0
+
+    assert await restarted.poll_once() == 0
+    assert restarted._pending
+    assert cards.calls == []
+
+    rollout.write_text(saved_contents)
+    assert await restarted.poll_once() == 1
+    assert restarted._pending == {}
+    assert len(cards.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_monitor_retries_only_remaining_target(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_started", "turn_id": "turn-1"}))
+    rollout.write_text(_metadata() + _line({"type": "task_started", "turn_id": "turn-1"}))
     sources = lambda: [{
         "thread_id": "thread-1",
         "title": "任务一",
@@ -266,7 +557,7 @@ async def test_monitor_retries_only_remaining_target(tmp_path):
 @pytest.mark.asyncio
 async def test_monitor_recovers_from_truncate_and_inode_replacement(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({
+    rollout.write_text(_metadata() + _line({
         "type": "task_started",
         "turn_id": "old",
         "padding": "x" * 4096,
@@ -284,12 +575,12 @@ async def test_monitor_recovers_from_truncate_and_inode_replacement(tmp_path):
     await monitor.register_target("user-1")
 
     # Same inode, shorter file after truncate.
-    rollout.write_text(_line({"type": "task_complete", "turn_id": "truncated"}))
+    rollout.write_text(_metadata() + _line({"type": "task_complete", "turn_id": "truncated"}))
     assert await monitor.poll_once() == 1
 
     # New inode at the same path.
     replacement = tmp_path / "replacement.jsonl"
-    replacement.write_text(_line({"type": "task_complete", "turn_id": "replaced"}))
+    replacement.write_text(_metadata() + _line({"type": "task_complete", "turn_id": "replaced"}))
     os.replace(replacement, rollout)
     assert await monitor.poll_once() == 1
     assert len(cards.calls) == 2
@@ -299,7 +590,7 @@ async def test_monitor_recovers_from_truncate_and_inode_replacement(tmp_path):
 @pytest.mark.asyncio
 async def test_monitor_waits_for_complete_json_line(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_started", "turn_id": "turn-1"}))
+    rollout.write_text(_metadata() + _line({"type": "task_started", "turn_id": "turn-1"}))
     sources = lambda: [{
         "thread_id": "thread-1",
         "title": "任务一",
@@ -323,7 +614,7 @@ async def test_monitor_waits_for_complete_json_line(tmp_path):
 @pytest.mark.asyncio
 async def test_monitor_streams_completion_record_larger_than_sixteen_megabytes(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
-    rollout.write_text(_line({"type": "task_started", "turn_id": "turn-large"}))
+    rollout.write_text(_metadata() + _line({"type": "task_started", "turn_id": "turn-large"}))
     sources = lambda: [{
         "thread_id": "thread-1",
         "title": "大回复任务",

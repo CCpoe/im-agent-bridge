@@ -106,10 +106,14 @@ class DesktopCompletionMonitor:
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            changed = await asyncio.to_thread(self._scan_new_events)
+            sources = await asyncio.to_thread(self._safe_sources)
+            # 必须先固定旧出箱记录的原始来源，再让扫描器迁移同 ID 的 cursor。
+            changed = await asyncio.to_thread(self._preserve_pending_sources)
+            scanned = await asyncio.to_thread(self._scan_new_events, sources)
+            changed = changed or scanned
             if changed:
                 self._save_state()
-            return await self._deliver_pending()
+            return await self._deliver_pending(sources)
 
     async def _run(self) -> None:
         while not self._closed:
@@ -124,6 +128,8 @@ class DesktopCompletionMonitor:
     def _snapshot_cursors(self, cutoff: float) -> Dict[str, Dict[str, Any]]:
         cursors: Dict[str, Dict[str, Any]] = {}
         for thread in self._safe_sources():
+            if _completion_source_eligibility(thread) is not True:
+                continue
             thread_id = _identifier(thread.get("thread_id"))
             path = _path(thread.get("_rollout_path"))
             if not thread_id or path is None:
@@ -149,10 +155,12 @@ class DesktopCompletionMonitor:
             }
         return cursors
 
-    def _scan_new_events(self) -> bool:
+    def _scan_new_events(self, sources: Iterable[Mapping[str, Any]]) -> bool:
         changed = False
         now = time.time()
-        for thread in self._safe_sources():
+        for thread in sources:
+            if _completion_source_eligibility(thread) is not True:
+                continue
             thread_id = _identifier(thread.get("thread_id"))
             path = _path(thread.get("_rollout_path"))
             if not thread_id or path is None:
@@ -212,6 +220,8 @@ class DesktopCompletionMonitor:
                     continue
                 self._pending[event_key] = {
                     "thread_id": thread_id,
+                    "source_path": str(path),
+                    "source_thread_id": thread_id,
                     "turn_id": _identifier(event.get("turn_id")) or "",
                     "outcome": event.get("outcome"),
                     "completed_at": event.get("timestamp") or "",
@@ -224,10 +234,59 @@ class DesktopCompletionMonitor:
                 changed = True
         return changed
 
-    async def _deliver_pending(self) -> int:
+    def _preserve_pending_sources(self) -> bool:
+        """升级旧出箱格式时保留原 cursor 证据，禁止借新根路径洗白子任务。"""
+
+        changed = False
+        for event_key, event in list(self._pending.items()):
+            thread_id = _identifier(event.get("thread_id"))
+            if "source_path" not in event:
+                cursor = self._cursors.get(thread_id) or {}
+                path = _path(cursor.get("path"))
+                # 即使来源已丢失也记录空值，不能下次拿新 cursor 冒充原始来源。
+                event["source_path"] = str(path) if path is not None else None
+                changed = True
+            eligible = _completion_source_eligibility({
+                "thread_id": thread_id,
+                "_rollout_path": event.get("source_path"),
+            })
+            if eligible is False:
+                self._pending.pop(event_key, None)
+                changed = True
+            elif eligible is True and event.get("source_thread_id") != thread_id:
+                event["source_thread_id"] = thread_id
+                changed = True
+        return changed
+
+    async def _deliver_pending(self, sources: Iterable[Mapping[str, Any]]) -> int:
         delivered_count = 0
         now = time.time()
+        sources_by_id = {
+            _identifier(thread.get("thread_id")): thread for thread in sources
+        }
         for event_key, event in list(self._pending.items()):
+            thread_id = _identifier(event.get("thread_id"))
+            thread = {
+                "thread_id": thread_id,
+                "_rollout_path": event.get("source_path"),
+            }
+            # 旧版本已入箱的子 Agent 完成事件也必须复核，不能在升级后重试误报。
+            # 文件暂不可读时保留待发事件，只有明确不属于该根线程才清理。
+            eligible = await asyncio.to_thread(_completion_source_eligibility, thread)
+            if eligible is False:
+                self._pending.pop(event_key, None)
+                self._save_state()
+                continue
+            if eligible is None and event.get("source_thread_id") == thread_id:
+                # 仅入箱时或迁移时已验明根身份的记录可跨路径恢复（例如归档）。
+                # 未验证旧记录不能仅凭当前存在同 ID 的根文件获得发送资格。
+                current_source = sources_by_id.get(thread_id)
+                if current_source is not None:
+                    eligible = await asyncio.to_thread(
+                        _completion_source_eligibility, current_source
+                    )
+            if eligible is not True:
+                continue
             if float(event.get("next_attempt_at") or 0) > now:
                 continue
             targets = [target for target in event.get("targets") or [] if target in self._targets]
@@ -330,6 +389,61 @@ class DesktopCompletionMonitor:
             os.replace(temporary, self.state_path)
         except OSError:
             logger.exception("无法持久化 Desktop 完成通知状态")
+
+
+def _is_subagent_metadata(metadata: Mapping[str, Any]) -> bool:
+    """只根据结构化来源判断子 Agent，不读取标题、提示词或工具载荷。"""
+
+    if (
+        metadata.get("_is_child")
+        or metadata.get("parent_thread_id")
+        or metadata.get("parentThreadId")
+        or metadata.get("thread_source") == "subagent"
+        or metadata.get("threadSource") == "subagent"
+    ):
+        return True
+    source = metadata.get("source")
+    if isinstance(source, str):
+        if source.lower() in {"subagent", "subagentthreadspawn"}:
+            return True
+        try:
+            source = json.loads(source)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if isinstance(source, str):
+        return source.lower() in {"subagent", "subagentthreadspawn"}
+    return isinstance(source, Mapping) and "subagent" in source
+
+
+def _completion_source_eligibility(thread: Mapping[str, Any]) -> Optional[bool]:
+    """返回根线程匹配、明确不匹配或暂无法确认三种结果。"""
+
+    if _is_subagent_metadata(thread):
+        return False
+    thread_id = _identifier(thread.get("thread_id"))
+    path = _path(thread.get("_rollout_path"))
+    if not thread_id or path is None:
+        return None
+    try:
+        with path.open("rb") as source:
+            first_line = source.readline(_MAX_LINE_BYTES + 1)
+        if not first_line.endswith(b"\n") or len(first_line) > _MAX_LINE_BYTES:
+            return None
+        record = json.loads(first_line)
+    except (OSError, json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, Mapping) or record.get("type") != "session_meta":
+        return None
+    metadata = record.get("payload")
+    if not isinstance(metadata, Mapping):
+        return None
+    if _is_subagent_metadata(metadata):
+        return False
+    # 子 Agent 会复用根 session_id；有自身 id 时绝不能用 session_id 冒充根。
+    rollout_id = _identifier(metadata.get("id"))
+    if rollout_id is None:
+        rollout_id = _identifier(metadata.get("session_id"))
+    return rollout_id == thread_id if rollout_id else None
 
 
 def _read_completion_events(path: Path, offset: int) -> tuple[List[Dict[str, Any]], int]:

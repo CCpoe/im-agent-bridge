@@ -30,6 +30,7 @@ MAX_CARD_MESSAGE_CHARS = 1_500
 MAX_CARD_QUERY_CHARS = 1_500
 MAX_PUBLIC_IMAGES = 8
 MAX_CARD_IMAGES = 4
+MAX_PUBLIC_SUB_AGENTS = 32
 DESKTOP_LIST_PAGE_SIZE = 5
 
 _PUBLIC_AGENT_PHASES = {None, "commentary", "final_answer"}
@@ -403,6 +404,58 @@ def _normalized_turn_status(value: Any) -> str:
     }.get(value, "unknown")
 
 
+def project_subagent_activity(item: Any) -> Optional[Dict[str, str]]:
+    """仅投影已确认的子 Agent 活动元数据，不读取提示词或执行内容。"""
+    if not isinstance(item, Mapping) or item.get("type") != "subAgentActivity":
+        return None
+    thread_id = item.get("agentThreadId")
+    kind = item.get("kind")
+    if (
+        not isinstance(thread_id, str)
+        or not thread_id.strip()
+        or len(thread_id) > 200
+        or not isinstance(kind, str)
+        or kind not in {"started", "interacted", "completed"}
+    ):
+        return None
+    return {
+        "thread_id": thread_id.strip(),
+        "agent_path": _clean_text(item.get("agentPath"), 240) or "",
+        "status": {"started": "running", "completed": "completed", "interacted": "unknown"}[kind],
+    }
+
+
+def _merge_sub_agent(rows: List[Dict[str, str]], row: Mapping[str, str]) -> None:
+    """按每轮 thread_id 去重，保留最新活动及最近使用的有界任务列表。"""
+    existing = next((item for item in rows if item["thread_id"] == row["thread_id"]), None)
+    projected = dict(row)
+    if not projected.get("agent_path") and existing is not None:
+        projected["agent_path"] = existing["agent_path"]
+    rows[:] = [item for item in rows if item["thread_id"] != row["thread_id"]]
+    rows.append(projected)
+    del rows[:-MAX_PUBLIC_SUB_AGENTS]
+
+
+def _sanitize_sub_agents(value: Any) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    if not isinstance(value, list):
+        return rows
+    for item in value:
+        status = item.get("status") if isinstance(item, Mapping) else None
+        if not isinstance(status, str) or status not in {"running", "completed", "failed", "interrupted", "unknown"}:
+            continue
+        projected = project_subagent_activity({
+            "type": "subAgentActivity",
+            "agentThreadId": item.get("thread_id"),
+            "agentPath": item.get("agent_path"),
+            "kind": "started",
+        })
+        if projected is not None:
+            projected["status"] = status
+            _merge_sub_agent(rows, projected)
+    return rows
+
+
 def _project_public_turn(turn: Any, fallback_id: str = "") -> Optional[Dict[str, Any]]:
     if not isinstance(turn, Mapping) or not isinstance(turn.get("items"), list):
         return None
@@ -415,6 +468,7 @@ def _project_public_turn(turn: Any, fallback_id: str = "") -> Optional[Dict[str,
         return None
     user_messages: List[Dict[str, str]] = []
     agent_messages: List[Dict[str, str]] = []
+    sub_agents: List[Dict[str, str]] = []
     for item in turn["items"]:
         user_message = _public_user_item(item)
         if user_message is not None:
@@ -423,12 +477,19 @@ def _project_public_turn(turn: Any, fallback_id: str = "") -> Optional[Dict[str,
         agent_message = _public_agent_item(item, turn_id)
         if agent_message is not None:
             agent_messages.append(agent_message)
-    return {
+            continue
+        sub_agent = project_subagent_activity(item)
+        if sub_agent is not None:
+            _merge_sub_agent(sub_agents, sub_agent)
+    result = {
         "turn_id": turn_id,
         "status": _normalized_turn_status(turn.get("status")),
         "user_messages": user_messages,
         "agent_messages": agent_messages[-MAX_PUBLIC_MESSAGES:],
     }
+    if sub_agents:
+        result["sub_agents"] = sub_agents
+    return result
 
 
 def _sanitize_public_turn(turn: Any) -> Optional[Dict[str, Any]]:
@@ -469,12 +530,16 @@ def _sanitize_public_turn(turn: Any) -> Optional[Dict[str, Any]]:
     status = turn.get("status")
     if status not in _STATUS_LABELS:
         status = "unknown"
-    return {
+    result = {
         "turn_id": turn_id,
         "status": status,
         "user_messages": user_messages,
         "agent_messages": agent_messages[-MAX_PUBLIC_MESSAGES:],
     }
+    sub_agents = _sanitize_sub_agents(turn.get("sub_agents"))
+    if sub_agents:
+        result["sub_agents"] = sub_agents
+    return result
 
 
 def extract_public_turns(state: Any) -> List[Dict[str, Any]]:
@@ -504,6 +569,16 @@ def extract_public_turns(state: Any) -> List[Dict[str, Any]]:
 
 
 def _safe_patch_item(item: Any, turn_id: str) -> Optional[Dict[str, Any]]:
+    sub_agent = project_subagent_activity(item)
+    if sub_agent is not None:
+        return {
+            "type": "subAgentActivity",
+            "id": _identifier(item.get("id")) or "",
+            "turn_id": turn_id,
+            "kind": item["kind"],
+            "agentThreadId": sub_agent["thread_id"],
+            "agentPath": sub_agent["agent_path"],
+        }
     agent = _public_agent_item(item, turn_id)
     if agent is not None:
         return dict(agent, type="agentMessage")
@@ -1084,6 +1159,9 @@ def _upsert_public_turn(
 def _remove_public_item(turns: List[Dict[str, Any]], item: Any, fallback_id: str) -> None:
     if not isinstance(item, Mapping):
         return
+    if item.get("type") == "subAgentActivity":
+        # 活动 item 与状态行不是一对一；由安全缓存按同轮同 Agent 重新聚合。
+        return
     turn_id = _identifier(item.get("turn_id"))
     item_id = _identifier(item.get("id")) or fallback_id
     item_type = item.get("type")
@@ -1118,7 +1196,12 @@ def _upsert_public_item(
         del turns[:-MAX_PUBLIC_TURNS]
 
     item_id = _identifier(item.get("id")) or fallback_id
-    if item.get("type") == "agentMessage":
+    if item.get("type") == "subAgentActivity":
+        projected_sub_agent = project_subagent_activity(item)
+        if projected_sub_agent is not None:
+            _merge_sub_agent(target.setdefault("sub_agents", []), projected_sub_agent)
+        return
+    elif item.get("type") == "agentMessage":
         projected_agent = _public_agent_item(item, turn_id)
         if projected_agent is None:
             return
@@ -1146,6 +1229,78 @@ def _upsert_public_item(
         del existing[:-MAX_PUBLIC_MESSAGES]
 
 
+def _patch_sub_agent_key(item: Any) -> Optional[Tuple[str, str]]:
+    row = project_subagent_activity(item)
+    turn_id = _identifier(item.get("turn_id")) if isinstance(item, Mapping) else None
+    return (turn_id, row["thread_id"]) if row is not None and turn_id else None
+
+
+def _shift_patch_item_indices(
+    patch_items: Dict[str, Any], list_path: Sequence[Any], index: int, delta: int
+) -> None:
+    """同步 Immer 数组插入/删除后的安全缓存路径，避免后续状态写到其它 item。"""
+    shifted: Dict[str, Any] = {}
+    for key, item in patch_items.items():
+        try:
+            path = json.loads(key)
+        except (TypeError, ValueError):
+            shifted[key] = item
+            continue
+        if (
+            isinstance(path, list)
+            and len(path) == len(list_path) + 1
+            and path[:-1] == list(list_path)
+            and isinstance(path[-1], int)
+            and path[-1] >= index
+        ):
+            path[-1] += delta
+            key = json.dumps(path, ensure_ascii=False, separators=(",", ":"))
+        shifted[key] = item
+    patch_items.clear()
+    patch_items.update(shifted)
+
+
+def _refresh_patch_sub_agent(
+    turns: List[Dict[str, Any]],
+    patch_items: Mapping[str, Any],
+    key: Tuple[str, str],
+) -> None:
+    """旧活动更新或删除时，按 wire item 顺序重算该 Agent，不影响其它轮。"""
+    turn_id, thread_id = key
+    target = next((turn for turn in turns if turn.get("turn_id") == turn_id), None)
+    if target is None:
+        return
+    activities = []
+    for path_key, item in patch_items.items():
+        if _patch_sub_agent_key(item) != key:
+            continue
+        try:
+            path = json.loads(path_key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(path, list) or not path or not isinstance(path[-1], int):
+            continue
+        # canonical 历史与 active turn 短暂重复时，当前 turn 的投影优先。
+        activities.append(((path[0] == "turns", path[-1]), item))
+    projected: List[Dict[str, str]] = []
+    for _, item in sorted(activities, key=lambda pair: pair[0]):
+        row = project_subagent_activity(item)
+        if row is not None:
+            _merge_sub_agent(projected, row)
+    rows = target.get("sub_agents", [])
+    previous = next((row for row in rows if row["thread_id"] == thread_id), None)
+    rows = [row for row in rows if row["thread_id"] != thread_id]
+    if projected:
+        row = projected[-1]
+        if not row["agent_path"] and previous is not None:
+            row["agent_path"] = previous["agent_path"]
+        _merge_sub_agent(rows, row)
+    if rows:
+        target["sub_agents"] = rows
+    else:
+        target.pop("sub_agents", None)
+
+
 def normalize_patch_only_update(
     current: Optional[Mapping[str, Any]],
     event: Any,
@@ -1153,7 +1308,7 @@ def normalize_patch_only_update(
     """Safely project useful v11 patches when a snapshot is unavailable.
 
     The patch projection recognizes only public user/steering text, public
-    assistant messages, turn status leaves and top-level requests.  It never
+    assistant messages, sub-agent activity metadata, turn status leaves and top-level requests.  It never
     recursively searches arbitrary payloads for displayable strings.
     """
     params = _event_params(event)
@@ -1246,6 +1401,9 @@ def normalize_patch_only_update(
                     _upsert_public_turn(turns, projected_turn)
                     if prefix_key:
                         patch_turn_ids[prefix_key] = projected_turn["turn_id"]
+                        for key in list(patch_items):
+                            if key.startswith(prefix_key[:-1] + ","):
+                                patch_items.pop(key, None)
                     for item_index, item in enumerate(value.get("items") or []):
                         item_key = json.dumps(
                             prefix + ["items", item_index],
@@ -1267,13 +1425,19 @@ def normalize_patch_only_update(
                 item_key = json.dumps(path[:item_offset], ensure_ascii=False, separators=(",", ":"))
 
         if item_key is not None and item_offset is not None:
+            whole_item = len(path) == item_offset and isinstance(path[-1], int)
+            if whole_item and op == "add":
+                _shift_patch_item_indices(patch_items, path[:-1], path[-1], 1)
             old_partial = patch_items.get(item_key)
+            old_sub_agent_key = _patch_sub_agent_key(old_partial)
             _remove_public_item(turns, old_partial, item_key)
             turn_id = _turn_id_for_patch_path(path, patch_turn_ids)
             if turn_id is None and prefix and prefix[0] == "turns":
                 turn_id = _identifier(result.get("active_turn_id"))
             if op == "remove" and len(path) == item_offset:
                 patch_items.pop(item_key, None)
+                if whole_item:
+                    _shift_patch_item_indices(patch_items, path[:-1], path[-1] + 1, -1)
             elif op in {"add", "replace"} and len(path) == item_offset and isinstance(value, Mapping):
                 projected_item = _safe_patch_item(value, turn_id or "")
                 if projected_item is not None:
@@ -1285,7 +1449,25 @@ def normalize_patch_only_update(
             elif item_key in patch_items and len(path) == item_offset + 1:
                 field = path[-1]
                 partial = patch_items[item_key]
-                if field in {"id", "type", "phase", "text", "images"}:
+                if partial.get("type") == "subAgentActivity":
+                    if field in {"id", "type", "kind", "agentThreadId", "agentPath"}:
+                        if op == "remove":
+                            partial.pop(field, None)
+                        elif field == "kind":
+                            if isinstance(value, str) and value in {"started", "interacted", "completed"}:
+                                partial[field] = value
+                            else:
+                                partial.pop(field, None)
+                        elif field == "type":
+                            if value != "subAgentActivity":
+                                patch_items.pop(item_key, None)
+                        elif field == "agentPath":
+                            partial[field] = _clean_text(value, 240) or ""
+                        elif isinstance(value, str) and 0 < len(value.strip()) <= 200:
+                            partial[field] = value.strip()
+                        else:
+                            partial.pop(field, None)
+                elif field in {"id", "type", "phase", "text", "images"}:
                     if op == "remove":
                         partial.pop(field, None)
                         if field == "text":
@@ -1320,6 +1502,8 @@ def normalize_patch_only_update(
 
             partial = patch_items.get(item_key)
             _upsert_public_item(turns, partial, item_key)
+            for sub_agent_key in {old_sub_agent_key, _patch_sub_agent_key(partial)} - {None}:
+                _refresh_patch_sub_agent(turns, patch_items, sub_agent_key)
 
         if op in {"add", "replace"} and isinstance(value, Mapping):
             if path and path[0] == "requests":
@@ -1786,6 +1970,31 @@ def _collapsible_digest(
     }
 
 
+def _sub_agents_panel(rows: List[Dict[str, str]]) -> Dict[str, Any]:
+    running = sum(row["status"] == "running" for row in rows)
+    completed = sum(row["status"] == "completed" for row in rows)
+    summary = "{} 运行中 · {} 已完成".format(running, completed)
+    for status, label in (("failed", "异常"), ("interrupted", "已停止"), ("unknown", "待同步")):
+        count = sum(row["status"] == status for row in rows)
+        if count:
+            summary += " · {} {}".format(count, label)
+    lines = []
+    for row in rows:
+        name = row["agent_path"].rstrip("/").rsplit("/", 1)[-1] or row["thread_id"]
+        name = _clean_text(" ".join(name.split()), 80) or row["thread_id"]
+        label = "状态待同步" if row["status"] == "unknown" else _STATUS_LABELS[row["status"]]
+        lines.append("{} · {}".format(name, label))
+    return _collapsible_digest(
+        "子 Agent 状态 · " + summary,
+        "收起子 Agent 状态 · " + summary,
+        [{
+            "tag": "div",
+            "text": {"tag": "plain_text", "content": "\n".join(lines), "text_align": "left"},
+            "text_size": "normal",
+        }],
+    )
+
+
 def _workspace_shell(
     elements: Iterable[Dict[str, Any]],
     *,
@@ -2144,6 +2353,9 @@ def build_desktop_card(
                 "收起较早进度（{}项）".format(len(older_messages)),
                 older_elements,
             ))
+
+        if selected_turn.get("sub_agents"):
+            elements.append(_sub_agents_panel(selected_turn["sub_agents"]))
 
         if len(public_turns) > 1 and selected_index is not None:
             previous_button: Dict[str, Any]
@@ -2564,6 +2776,7 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
 
 
 __all__ = [
+    "MAX_PUBLIC_SUB_AGENTS",
     "PatchApplyError",
     "apply_immer_patches",
     "build_desktop_card",
@@ -2575,4 +2788,5 @@ __all__ = [
     "normalize_conversation_state",
     "normalize_desktop_update",
     "normalize_patch_only_update",
+    "project_subagent_activity",
 ]
