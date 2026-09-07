@@ -1696,7 +1696,23 @@ def _highlight_grid(
     right_label: str,
     right_title: str,
     right_detail: str,
+    *,
+    right_action: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    right_surface = _surface([
+        _markdown("<font color='codex_on_accent'>{}</font>".format(right_label),
+                  text_size="notation"),
+        _markdown("<font color='codex_on_accent'>**{}**</font>".format(right_title),
+                  text_size="heading-2", margin="6px 0px 0px 0px"),
+        _markdown("<font color='codex_on_accent'>{}</font>".format(right_detail),
+                  text_size="notation", margin="8px 0px 0px 0px"),
+    ], background="codex_accent_2", margin="0px 0px 0px 0px")
+    if right_action:
+        # 整个 NEXT 区域承接连接操作，保留原来的 callback 协议。
+        right_surface["behaviors"] = [{"type": "callback", "value": dict(right_action)}]
+        right_surface["hover_tips"] = {
+            "tag": "plain_text", "content": right_title, "text_align": "left",
+        }
     return {
         "tag": "column_set",
         "flex_mode": "stretch",
@@ -1723,14 +1739,7 @@ def _highlight_grid(
                 "width": "weighted",
                 "weight": 1,
                 "vertical_align": "top",
-                "elements": [_surface([
-                    _markdown("<font color='codex_on_accent'>{}</font>".format(right_label),
-                              text_size="notation"),
-                    _markdown("<font color='codex_on_accent'>**{}**</font>".format(right_title),
-                              text_size="heading-2", margin="6px 0px 0px 0px"),
-                    _markdown("<font color='codex_on_accent'>{}</font>".format(right_detail),
-                              text_size="notation", margin="8px 0px 0px 0px"),
-                ], background="codex_accent_2", margin="0px 0px 0px 0px")],
+                "elements": [right_surface],
             },
         ],
         "margin": "0px 0px 0px 0px",
@@ -2504,7 +2513,8 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
     """Build a standalone completion notification with a reconnect action."""
 
     event = event if isinstance(event, Mapping) else {}
-    thread_id = _identifier(event.get("thread_id")) or ""
+    raw_thread_id = event.get("thread_id")
+    thread_id = raw_thread_id.strip() if isinstance(raw_thread_id, str) else ""
     title = _clean_text(event.get("title"), 160) or "Codex Desktop 任务"
     project_name = _clean_text(event.get("project_name"), 120)
     outcome = "failed" if event.get("outcome") == "failed" else "completed"
@@ -2520,8 +2530,12 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
         status_text,
         "查看公开回复后决定是否继续。" if failed else "当前轮次已经完成。",
         "NEXT",
-        "重新连接",
-        "进入原任务并继续发送指令。",
+        "重新连接" if thread_id else "无法重新连接",
+        "点击此处进入原任务并继续发送指令。" if thread_id else "缺少 Session ID，无法定位原任务。",
+        right_action={
+            "action": "desktop_attach",
+            "thread_id": thread_id,
+        } if thread_id else None,
     ))
     details = []
     if project_name:
@@ -2532,15 +2546,7 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
     completed_at = _clean_text(event.get("completed_at"), 80)
     if completed_at:
         details.append(f"<font color='grey'>时间：{completed_at}</font>")
-    surface_elements = [_markdown("\n".join(details))]
-    if thread_id:
-        surface_elements.append(_theme_control_row([
-            _theme_control("连接此 Session", {
-                "action": "desktop_attach",
-                "thread_id": thread_id,
-            }, primary=True),
-        ]))
-    elements.append(_surface(surface_elements))
+    elements.append(_surface([_markdown("\n".join(details))]))
     elements.append(_footer("IM Agent Bridge · Codex Desktop 完成提醒"))
     return {
         "schema": "2.0",

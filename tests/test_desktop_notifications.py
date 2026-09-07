@@ -149,7 +149,9 @@ async def test_monitor_skips_history_then_notifies_each_new_completion(tmp_path)
     rendered = json.dumps(card, ensure_ascii=False)
     assert "<font color='codex_on_accent'>**执行完成**</font>" in rendered
     assert card["config"]["summary"]["content"]
-    assert "连接此 Session" in rendered
+    assert "NEXT" in rendered
+    assert "重新连接" in rendered
+    assert "连接此 Session" not in rendered
     assert len(message_uuid) == 36
 
     with rollout.open("a") as target:

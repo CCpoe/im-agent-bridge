@@ -773,6 +773,33 @@ def test_desktop_list_card_uses_thread_ids_for_attach():
     assert '"action": "desktop_list_page"' not in rendered
 
 
+@pytest.mark.parametrize("archived", [False, True])
+def test_desktop_list_highlights_stay_passive_and_rows_keep_attach_actions(archived):
+    card = build_desktop_list_card([
+        {"thread_id": "thread-1", "title": "任务一"},
+        {"thread_id": "thread-2", "title": "任务二"},
+    ], archived=archived)
+
+    assert _callback_values(card, "desktop_attach") == [
+        {"action": "desktop_attach", "thread_id": "thread-1"},
+        {"action": "desktop_attach", "thread_id": "thread-2"},
+    ]
+    for label in ("TASKS", "PAGE"):
+        highlights = [
+            node for node in _walk_card(card)
+            if node.get("tag") == "interactive_container"
+            and any(
+                child.get("tag") == "markdown"
+                and child.get("content") == (
+                    f"<font color='codex_on_accent'>{label}</font>"
+                )
+                for child in node.get("elements", [])
+            )
+        ]
+        assert len(highlights) == 1
+        assert _callback_values(highlights[0]) == []
+
+
 @pytest.mark.parametrize(("status", "label"), [
     ("running", "运行中"),
     ("waiting_approval", "等待审批"),
@@ -899,8 +926,47 @@ def test_desktop_completion_card_can_reconnect(outcome, label):
     assert f"<font color='codex_on_accent'>**{label}**</font>" in rendered
     assert "**项目名称**" in rendered
     assert "Session：**会话名称**" in rendered
-    assert '"action": "desktop_attach"' in rendered
-    assert '"thread_id": "thread-1"' in rendered
+    expected_action = {"action": "desktop_attach", "thread_id": "thread-1"}
+    assert _callback_values(card, "desktop_attach") == [expected_action]
+    reconnect_controls = [
+        node for node in _walk_card(card)
+        if node.get("behaviors") == [{"type": "callback", "value": expected_action}]
+    ]
+    assert len(reconnect_controls) == 1
+    reconnect_control = reconnect_controls[0]
+    assert reconnect_control["tag"] == "interactive_container"
+    assert reconnect_control["background_style"] == "codex_accent_2"
+    reconnect_content = json.dumps(reconnect_control, ensure_ascii=False)
+    assert "NEXT" in reconnect_content
+    assert "重新连接" in reconnect_content
+    assert "连接此 Session" not in rendered
+    assert "连接到此 Session" not in rendered
+
+
+@pytest.mark.parametrize("thread_fields", [
+    {},
+    {"thread_id": None},
+    {"thread_id": ""},
+    {"thread_id": " \t\n "},
+    {"thread_id": 123},
+    {"thread_id": True},
+    {"thread_id": ["thread-1"]},
+    {"thread_id": {"id": "thread-1"}},
+])
+def test_desktop_completion_without_valid_thread_id_has_no_reconnect(thread_fields):
+    card = build_desktop_completion_card({
+        "title": "会话名称",
+        "outcome": "completed",
+        **thread_fields,
+    })
+    rendered = json.dumps(card, ensure_ascii=False)
+
+    assert _callback_values(card, "desktop_attach") == []
+    assert "无法重新连接" in rendered
+    assert "缺少" in rendered
+    assert "Session ID" in rendered
+    assert "连接此 Session" not in rendered
+    assert "连接到此 Session" not in rendered
 
 
 def test_bad_patch_and_revision_mismatch_fail_closed():
