@@ -4,6 +4,7 @@ import json
 import pytest
 
 from lark_client.desktop_card import (
+    MAX_PUBLIC_SUB_AGENTS,
     PatchApplyError,
     apply_immer_patches,
     build_desktop_card,
@@ -15,6 +16,7 @@ from lark_client.desktop_card import (
     normalize_conversation_state,
     normalize_desktop_update,
     normalize_patch_only_update,
+    project_subagent_activity,
 )
 
 
@@ -99,6 +101,217 @@ def _event(change):
             "change": change,
         },
     }
+
+
+def _sub_agent_item(thread_id="child-1", kind="started", agent_path="/root/review"):
+    return {
+        "id": "activity-{}-{}".format(thread_id, kind),
+        "type": "subAgentActivity",
+        "kind": kind,
+        "agentThreadId": thread_id,
+        "agentPath": agent_path,
+        "prompt": "SECRET_CHILD_PROMPT",
+        "tool": {"output": "SECRET_CHILD_TOOL_OUTPUT"},
+        "reasoning": "SECRET_CHILD_REASONING",
+    }
+
+
+@pytest.mark.parametrize(("kind", "status"), [
+    ("started", "running"), ("completed", "completed"), ("interacted", "unknown"),
+])
+def test_project_subagent_activity_exposes_only_known_metadata(kind, status):
+    row = project_subagent_activity(_sub_agent_item(kind=kind))
+    assert row == {"thread_id": "child-1", "agent_path": "/root/review", "status": status}
+
+
+@pytest.mark.parametrize("fields", [
+    {"type": "reasoning"}, {"kind": "SECRET_UNKNOWN_KIND"}, {"kind": {}},
+    {"agentThreadId": ""}, {"agentThreadId": None}, {"agentThreadId": ["child-1"]},
+])
+def test_project_subagent_activity_rejects_unknown_or_invalid_metadata(fields):
+    assert project_subagent_activity(dict(_sub_agent_item(), **fields)) is None
+
+
+def test_snapshot_sub_agents_are_bounded_deduplicated_and_do_not_complete_parent():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].extend([
+        _sub_agent_item(),
+        _sub_agent_item(kind="completed"),
+        _sub_agent_item("child-2", "started", "/root/tests"),
+        {"type": "subAgentActivity", "agentThreadId": "unknown-child", "kind": "unknown"},
+    ])
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    assert normalized["turns"][0]["sub_agents"] == [
+        {"thread_id": "child-1", "agent_path": "/root/review", "status": "completed"},
+        {"thread_id": "child-2", "agent_path": "/root/tests", "status": "running"},
+    ]
+    assert normalized["status"] == "running"
+    assert normalized["active_turn_id"] == "turn-1"
+    rendered = json.dumps(normalized, ensure_ascii=False)
+    for secret in ("SECRET_CHILD_PROMPT", "SECRET_CHILD_TOOL_OUTPUT", "SECRET_CHILD_REASONING"):
+        assert secret not in rendered
+    card = build_desktop_card(normalized)
+    assert card["config"]["summary"]["content"].endswith("运行中")
+    panel = next(node for node in _walk_card(card) if node.get("tag") == "collapsible_panel")
+    assert panel["header"]["title"]["content"] == "子 Agent 状态 · 1 运行中 · 1 已完成"
+    assert panel["header"]["icon"] == {
+        "tag": "standard_icon", "token": "down_outlined", "color": "grey",
+    }
+    assert panel["header"]["icon_position"] == "right"
+    assert panel["header"]["icon_expanded_angle"] == -180
+    assert panel["elements"][0]["text"]["content"] == "review · 已完成\ntests · 运行中"
+    assert "/root/" not in json.dumps(panel, ensure_ascii=False)
+    assert _callback_values(card, "desktop_interrupt") == [{
+        "action": "desktop_interrupt", "thread_id": "thread-1", "turn_id": "turn-1",
+    }]
+
+    snapshot["turns"][0]["items"] = [
+        _sub_agent_item("child-{}".format(index))
+        for index in range(MAX_PUBLIC_SUB_AGENTS + 10)
+    ]
+    rows = normalize_conversation_state(snapshot, retain_raw=False)["turns"][0]["sub_agents"]
+    assert len(rows) == MAX_PUBLIC_SUB_AGENTS
+    assert rows[0]["thread_id"] == "child-10"
+
+
+def test_sub_agents_interacted_awaits_status_sync_instead_of_guessing_restart():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].extend([
+        _sub_agent_item(), _sub_agent_item(kind="completed"),
+        _sub_agent_item(kind="interacted"),
+    ])
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    assert normalized["turns"][0]["sub_agents"][0]["status"] == "unknown"
+    assert "review · 状态待同步" in json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted", "unknown"])
+def test_normalized_sub_agent_lifecycle_status_and_extra_fields_are_sanitized(status):
+    normalized = normalize_conversation_state(_snapshot(), retain_raw=False)
+    normalized["turns"][0]["sub_agents"] = [{
+        "thread_id": "child-1", "agent_path": "/root/review", "status": status,
+        "prompt": "SECRET_NORMALIZED_PROMPT", "reasoning": "SECRET_NORMALIZED_REASONING",
+    }]
+    rows = extract_public_turns(normalized)[0]["sub_agents"]
+    assert rows == [{"thread_id": "child-1", "agent_path": "/root/review", "status": status}]
+    rendered = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert "SECRET_NORMALIZED" not in rendered
+    assert {"failed": "review · 异常", "interrupted": "review · 已停止", "unknown": "review · 状态待同步"}[status] in rendered
+
+
+@pytest.mark.parametrize("patch_only", [False, True])
+def test_sub_agent_patch_add_kind_update_and_remove_preserve_parent_state(patch_only):
+    current = normalize_conversation_state(_snapshot(), retain_raw=not patch_only)
+    current["revision"] = 0
+    update = normalize_patch_only_update if patch_only else normalize_desktop_update
+    added = update(current, _event({"type": "patches", "baseRevision": 0, "revision": 1, "patches": [{
+        "op": "add", "path": ["turns", 0, "items", 3], "value": _sub_agent_item(),
+    }]}))
+    assert added["turns"][0]["sub_agents"][0]["status"] == "running"
+    completed = update(added, _event({"type": "patches", "baseRevision": 1, "revision": 2, "patches": [
+        {"op": "replace", "path": ["turns", 0, "items", 3, "kind"], "value": "completed"},
+        {"op": "add", "path": ["turns", 0, "items", 3, "prompt"], "value": "SECRET_PATCH_PROMPT"},
+    ]}))
+    assert completed["turns"][0]["sub_agents"][0]["status"] == "completed"
+    assert completed["status"] == "running"
+    assert completed["active_turn_id"] == "turn-1"
+    assert completed["turns"][0]["status"] == "running"
+    assert "SECRET_PATCH_PROMPT" not in json.dumps(build_desktop_card(completed), ensure_ascii=False)
+    if patch_only:
+        assert "SECRET_PATCH_PROMPT" not in json.dumps(completed, ensure_ascii=False)
+    removed = update(completed, _event({"type": "patches", "baseRevision": 2, "revision": 3, "patches": [{
+        "op": "remove", "path": ["turns", 0, "items", 3],
+    }]}))
+    assert "sub_agents" not in removed["turns"][0]
+    assert "子 Agent 状态" not in json.dumps(build_desktop_card(removed), ensure_ascii=False)
+
+
+def test_sub_agent_patch_updates_use_item_order_and_preserve_other_agents():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].extend([
+        _sub_agent_item(), _sub_agent_item(kind="completed"),
+        _sub_agent_item("child-2", "started", "/root/tests"),
+    ])
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    changed = normalize_patch_only_update(normalized, _event({"type": "patches", "patches": [{
+        "op": "replace", "path": ["turns", 0, "items", 3, "kind"], "value": "interacted",
+    }]}))
+    rows = {row["thread_id"]: row for row in changed["turns"][0]["sub_agents"]}
+    assert len(rows) == 2
+    assert rows["child-1"]["status"] == "completed"
+    assert rows["child-2"]["status"] == "running"
+    removed = normalize_patch_only_update(changed, _event({"type": "patches", "patches": [{
+        "op": "remove", "path": ["turns", 0, "items", 4],
+    }]}))
+    rows = {row["thread_id"]: row for row in removed["turns"][0]["sub_agents"]}
+    assert rows["child-1"]["status"] == "unknown"
+    assert rows["child-2"]["status"] == "running"
+
+
+def test_sub_agent_patch_only_array_indices_follow_insertions_and_removals():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].extend([
+        _sub_agent_item(), _sub_agent_item("child-2", "started", "/root/tests"),
+    ])
+    current = normalize_conversation_state(snapshot, retain_raw=False)
+    changed = normalize_patch_only_update(current, _event({"type": "patches", "patches": [
+        {"op": "add", "path": ["turns", 0, "items", 3], "value": _sub_agent_item("child-3")},
+        {"op": "replace", "path": ["turns", 0, "items", 5, "kind"], "value": "completed"},
+        {"op": "remove", "path": ["turns", 0, "items", 4]},
+        {"op": "replace", "path": ["turns", 0, "items", 4, "kind"], "value": "interacted"},
+    ]}))
+    rows = {row["thread_id"]: row for row in changed["turns"][0]["sub_agents"]}
+    assert set(rows) == {"child-2", "child-3"}
+    assert rows["child-2"]["status"] == "unknown"
+    assert rows["child-3"]["status"] == "running"
+    assert changed["status"] == "running"
+
+
+def test_canonical_sub_agent_history_and_live_turns_remain_isolated():
+    snapshot = _snapshot()
+    snapshot["turnHistory"] = {"kind": "canonical", "history": {
+        "islands": [{"entries": [{"value": "turn-history"}]}],
+        "entitiesByKey": {"turn-history": {
+            "turnId": "turn-history", "status": "completed",
+            "items": [_sub_agent_item("history-child", "completed", "/root/history_review")],
+        }},
+    }}
+    snapshot["turns"][0]["items"].append(_sub_agent_item("live-child", "started", "/root/live_tests"))
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    assert [turn["turn_id"] for turn in normalized["turns"]] == ["turn-history", "turn-1"]
+    historical = json.dumps(build_desktop_card(normalized, selected_turn_id="turn-history"), ensure_ascii=False)
+    live = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert "history_review · 已完成" in historical and "live_tests" not in historical
+    assert "live_tests · 运行中" in live and "history_review" not in live
+    changed = normalize_patch_only_update(normalized, _event({"type": "patches", "patches": [{
+        "op": "replace",
+        "path": ["turnHistory", "history", "entitiesByKey", "turn-history", "items", 0, "kind"],
+        "value": "interacted",
+    }]}))
+    assert changed["turns"][0]["sub_agents"][0]["status"] == "unknown"
+    assert changed["turns"][1]["sub_agents"][0]["status"] == "running"
+    assert changed["status"] == "running"
+    shell = build_desktop_card(changed)["body"]["elements"][0]["elements"]
+    panel_index = next(index for index, node in enumerate(shell) if node.get("tag") == "collapsible_panel")
+    navigation_index = next(index for index, node in enumerate(shell) if _callback_values(node, "desktop_turn_page"))
+    assert panel_index < navigation_index
+
+
+def test_sub_agent_patch_only_whole_turn_replacement_drops_stale_activity_cache():
+    current = normalize_conversation_state(_snapshot(), retain_raw=False)
+    changed = normalize_patch_only_update(current, _event({"type": "patches", "patches": [{
+        "op": "replace", "path": ["turns", 0], "value": {
+            "turnId": "turn-1", "status": "inProgress", "items": [_sub_agent_item()],
+        },
+    }]}))
+    assert changed["turns"][0]["sub_agents"][0]["status"] == "running"
+    replaced = normalize_patch_only_update(changed, _event({"type": "patches", "patches": [{
+        "op": "replace", "path": ["turns", 0], "value": {
+            "turnId": "turn-1", "status": "inProgress", "items": [],
+        },
+    }]}))
+    assert "sub_agents" not in replaced["turns"][0]
+    assert replaced["_patch_items"] == {}
 
 
 def test_snapshot_normalization_and_card_only_expose_public_agent_messages():

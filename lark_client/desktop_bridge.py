@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -22,14 +23,18 @@ from urllib.parse import unquote, urlparse
 from .card_service import CardState
 from .codex_app_server import CodexAppServerClient
 from .desktop_card import (
+    MAX_PUBLIC_SUB_AGENTS,
     NORMALIZED_VERSION,
     build_desktop_card,
     extract_card_image_sources,
+    extract_public_turns,
     normalize_conversation_state,
     normalize_patch_only_update,
+    project_subagent_activity,
 )
-from .desktop_notifications import DesktopCompletionMonitor
+from .desktop_notifications import DesktopCompletionMonitor, _is_subagent_metadata
 from .desktop_ipc import DEFAULT_HOST_ID, DesktopIPCClient, DesktopIPCRemoteError
+from .desktop_subagents import SubagentStatusReader
 
 
 logger = logging.getLogger("DesktopBridge")
@@ -39,6 +44,7 @@ ROLLOUT_QUERY_SCAN_BYTES = 64 * 1024 * 1024
 ROLLOUT_QUERY_LINE_BYTES = 1024 * 1024
 IMAGE_UPLOAD_RETRY_SECONDS = 60.0
 MAX_IMAGE_CACHE_ENTRIES = 128
+SUBAGENT_REFRESH_SECONDS = 2.0
 
 class DesktopBridgeManager:
     """管理聊天与 Desktop 线程的绑定和实时卡片。"""
@@ -87,6 +93,9 @@ class DesktopBridgeManager:
         self._states: Dict[str, Dict[str, Any]] = {}
         self._thread_metadata: Dict[str, Dict[str, Any]] = {}
         self._rollout_status_cache: Dict[str, tuple[int, int, str]] = {}
+        self._subagent_status_reader = SubagentStatusReader(self.sessions_dir)
+        self._subagent_refresh_task: Optional[asyncio.Task] = None
+        self._public_dirty_threads: set[str] = set()
         self._chat_locks: Dict[str, asyncio.Lock] = {}
         self._operation_locks: Dict[str, asyncio.Lock] = {}
         self._unarchive_locks: Dict[str, asyncio.Lock] = {}
@@ -145,6 +154,7 @@ class DesktopBridgeManager:
                 await self._publish_card(chat_id, state, replace=True)
             for thread_id in set(self._bindings.values()):
                 await self._follow_and_request_snapshot(thread_id, quiet=True)
+            self._ensure_subagent_refresh_started()
             return True
 
     async def close(self) -> None:
@@ -167,6 +177,7 @@ class DesktopBridgeManager:
             await asyncio.gather(*card_tasks, return_exceptions=True)
         self._card_flush_tasks.clear()
         self._pending_card_states.clear()
+        self._public_dirty_threads.clear()
         image_tasks = list(self._image_upload_tasks.values())
         for task in image_tasks:
             task.cancel()
@@ -225,6 +236,7 @@ class DesktopBridgeManager:
             self._users[chat_id] = str(user_id)
         state = self._states.get(thread_id) or self._seed_state_from_rollout(thread_id)
         self._states[thread_id] = state
+        self._ensure_subagent_refresh_started()
         await self._publish_card(
             chat_id,
             state,
@@ -586,7 +598,7 @@ class DesktopBridgeManager:
                     # 子 Agent 的 rollout 常复用根 session_id；仅允许自身 id
                     # 与索引线程一致的 rollout 为该线程提供元数据。
                     thread_id = item_id if item_id in missing else None
-                    if thread_id is None and session_id in missing and not payload.get("parent_thread_id"):
+                    if thread_id is None and session_id in missing and not _is_subagent_metadata(payload):
                         thread_id = session_id
                     if thread_id is None:
                         continue
@@ -603,7 +615,7 @@ class DesktopBridgeManager:
                     found[thread_id] = {
                         "cwd": cwd if isinstance(cwd, str) else None,
                         "originator": originator if isinstance(originator, str) else None,
-                        "_is_child": bool(payload.get("parent_thread_id")),
+                        "_is_child": _is_subagent_metadata(payload),
                         "_git_repository_url": (
                             repository_url if isinstance(repository_url, str) else None
                         ),
@@ -715,13 +727,15 @@ class DesktopBridgeManager:
             thread_id = _clean_thread_id(raw.get("id"))
             if (
                 not thread_id
-                or raw.get("threadSource") == "subagent"
-                or raw.get("parentThreadId")
+                or _is_subagent_metadata(raw)
             ):
                 continue
             path = _path_value(raw.get("path"))
             metadata = _read_rollout_metadata_file(path) if path is not None else {}
             if metadata.get("_is_child"):
+                continue
+            if metadata.get("thread_id") not in (None, thread_id):
+                # 数据库可能指向复用了根 session_id 的子文件，不能借用其状态。
                 continue
             originator = metadata.get("originator")
             source = raw.get("source")
@@ -1175,8 +1189,22 @@ class DesktopBridgeManager:
             normalized["patch_only"] = True
         else:
             normalized = normalize_patch_only_update(previous, params)
-        self._states[thread_id] = normalized
         if _public_state_key(previous) != _public_state_key(normalized):
+            self._public_dirty_threads.add(thread_id)
+        # 先记录 IPC 投影，使并发到达的后续 patch 能继承本次增量。
+        self._states[thread_id] = normalized
+        enriched = await asyncio.to_thread(self._with_subagent_statuses, normalized)
+        # 文件读取期间到达的另一份 IPC 更新优先，不能用旧状态覆盖新状态。
+        if self._states.get(thread_id) is not normalized:
+            return
+        if _public_state_key(normalized) != _public_state_key(enriched):
+            self._public_dirty_threads.add(thread_id)
+        normalized = enriched
+        self._states[thread_id] = enriched
+        self._ensure_subagent_refresh_started()
+        if thread_id in self._public_dirty_threads:
+            # 后续 reasoning-only patch 也要发布前一个慢回调留下的公开变化。
+            self._public_dirty_threads.discard(thread_id)
             immediate = (
                 normalized.get("pending") != (previous or {}).get("pending")
                 or (
@@ -1192,6 +1220,77 @@ class DesktopBridgeManager:
                         await self._publish_card(chat_id, normalized)
                     else:
                         self._schedule_card_publish(chat_id, normalized, immediate=immediate)
+
+    def _with_subagent_statuses(self, state: Mapping[str, Any]) -> Dict[str, Any]:
+        """仅为最新父轮补充子任务自身状态，历史轮不跟随子任务后续轮次变化。"""
+
+        turns = extract_public_turns(state)
+        agents = turns[-1].get("sub_agents") if turns else None
+        if not agents:
+            return dict(state)
+        thread_id = _clean_thread_id(state.get("thread_id"))
+        if not thread_id:
+            return dict(state)
+        turns = copy.deepcopy(turns)
+        for agent in turns[-1]["sub_agents"][:MAX_PUBLIC_SUB_AGENTS]:
+            status = self._subagent_status_reader.get_status(agent["thread_id"], thread_id)
+            agent["status"] = status or "unknown"
+        result = dict(state)
+        result["turns"] = turns
+        return result
+
+    async def _refresh_subagent_states(self) -> None:
+        for thread_id in set(self._bindings.values()):
+            previous = self._states.get(thread_id)
+            if not isinstance(previous, Mapping):
+                continue
+            turns = extract_public_turns(previous)
+            if not turns or not any(
+                agent.get("status") in {"running", "unknown"}
+                for agent in turns[-1].get("sub_agents", [])
+            ):
+                continue
+            refreshed = await asyncio.to_thread(self._with_subagent_statuses, previous)
+            if self._states.get(thread_id) is not previous:
+                continue
+            if _public_state_key(previous) == _public_state_key(refreshed):
+                continue
+            self._states[thread_id] = refreshed
+            for chat_id, bound_thread in list(self._bindings.items()):
+                if bound_thread != thread_id:
+                    continue
+                if self.card_update_interval == 0:
+                    await self._publish_card(chat_id, refreshed)
+                else:
+                    self._schedule_card_publish(chat_id, refreshed)
+
+    def _ensure_subagent_refresh_started(self) -> None:
+        if not self._started or self._closed or not self._bindings:
+            return
+        if self._subagent_refresh_task is not None and not self._subagent_refresh_task.done():
+            return
+        if not any(
+            turn.get("sub_agents")
+            for thread_id in set(self._bindings.values())
+            for turn in extract_public_turns(self._states.get(thread_id))[-1:]
+        ):
+            return
+
+        async def refresh() -> None:
+            try:
+                while not self._closed and self._bindings:
+                    await asyncio.sleep(SUBAGENT_REFRESH_SECONDS)
+                    try:
+                        await self._refresh_subagent_states()
+                    except Exception:
+                        logger.exception("刷新子 Agent 状态失败")
+            finally:
+                self._subagent_refresh_task = None
+
+        task = asyncio.create_task(refresh(), name="desktop-subagent-status")
+        self._subagent_refresh_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _follow_and_request_snapshot(self, thread_id: str, *, quiet: bool) -> bool:
         try:
@@ -1379,12 +1478,16 @@ class DesktopBridgeManager:
         )
         if not matches:
             return state
+        metadata = _read_rollout_metadata_file(matches[0])
+        if metadata.get("_is_child") or metadata.get("thread_id") not in (None, thread_id):
+            return state
 
         messages: List[Dict[str, Any]] = []
         turns: List[Dict[str, Any]] = []
         current_turn: Optional[Dict[str, Any]] = None
         status = "unknown"
         active_turn_id: Any = None
+        subagents_by_turn: Dict[str, Dict[str, Dict[str, str]]] = {}
         try:
             with matches[0].open("rb") as source:
                 size = source.seek(0, os.SEEK_END)
@@ -1398,9 +1501,43 @@ class DesktopBridgeManager:
                         continue
                     if record.get("type") != "event_msg":
                         continue
-                    payload = record.get("payload") or {}
+                    payload = record.get("payload")
+                    if not isinstance(payload, Mapping):
+                        continue
+                    record_thread_id = _clean_thread_id(payload.get("thread_id"))
+                    if record_thread_id and record_thread_id != thread_id:
+                        continue
                     event_type = payload.get("type")
-                    if event_type == "task_started":
+                    if event_type == "item_completed":
+                        item = payload.get("item")
+                        if not isinstance(item, Mapping) or item.get("type") != "SubAgentActivity":
+                            continue
+                        activity_turn_id = _clean_thread_id(payload.get("turn_id"))
+                        if record_thread_id != thread_id or not activity_turn_id:
+                            continue
+                        agent = project_subagent_activity({
+                            "type": "subAgentActivity",
+                            "agentThreadId": item.get("agent_thread_id"),
+                            "agentPath": item.get("agent_path"),
+                            "kind": item.get("kind"),
+                        })
+                        if agent is None:
+                            continue
+                        agents = subagents_by_turn.setdefault(activity_turn_id, {})
+                        agents[agent["thread_id"]] = agent
+                        while len(agents) > MAX_PUBLIC_SUB_AGENTS:
+                            agents.pop(next(iter(agents)))
+                        if not turns:
+                            activity_turn = {
+                                "turn_id": activity_turn_id,
+                                "status": "unknown",
+                                "user_messages": [],
+                                "agent_messages": [],
+                            }
+                            turns.append(activity_turn)
+                            if current_turn is None:
+                                current_turn = activity_turn
+                    elif event_type == "task_started":
                         status = "running"
                         active_turn_id = payload.get("turn_id")
                         turn_id = str(active_turn_id or record.get("timestamp") or "")
@@ -1502,12 +1639,15 @@ class DesktopBridgeManager:
                 turns[-1]["user_messages"] = recent_users
         state["status"] = status
         state["active_turn_id"] = active_turn_id
+        for turn in turns:
+            if turn["turn_id"] in subagents_by_turn:
+                turn["sub_agents"] = list(subagents_by_turn[turn["turn_id"]].values())
         state["turns"] = turns[-20:]
         state["messages"] = messages[-20:]
         state["_patch_turn_ids"] = (
             {'["turns",0]': str(active_turn_id)} if active_turn_id else {}
         )
-        return state
+        return self._with_subagent_statuses(state)
 
     def _title_from_index(self, thread_id: str) -> Optional[str]:
         title: Optional[str] = None
@@ -1598,10 +1738,12 @@ def _path_value(value: Any) -> Optional[Path]:
 def _read_rollout_metadata_file(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as source:
-            record = json.loads(source.readline())
+            record = json.loads(source.readline(1024 * 1024 + 1))
     except (OSError, json.JSONDecodeError, TypeError, UnicodeDecodeError):
         return {}
-    payload = record.get("payload") if isinstance(record, Mapping) else None
+    if not isinstance(record, Mapping) or record.get("type") != "session_meta":
+        return {}
+    payload = record.get("payload")
     if not isinstance(payload, Mapping):
         return {}
     git = payload.get("git")
@@ -1612,7 +1754,7 @@ def _read_rollout_metadata_file(path: Path) -> Dict[str, Any]:
         "originator": (
             payload.get("originator") if isinstance(payload.get("originator"), str) else None
         ),
-        "_is_child": bool(payload.get("parent_thread_id")),
+        "_is_child": _is_subagent_metadata(payload),
         "_git_repository_url": (
             repository_url if isinstance(repository_url, str) else None
         ),

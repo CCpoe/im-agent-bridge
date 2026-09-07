@@ -11,7 +11,9 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
   tests/test_desktop_card.py \
   tests/test_desktop_bridge.py \
   tests/test_desktop_lark_integration.py \
-  tests/test_option_select.py
+  tests/test_option_select.py \
+  tests/test_card_service_images.py \
+  tests/test_desktop_subagents.py
 ```
 
 覆盖范围：
@@ -21,6 +23,14 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
 - `/desktop` 列表的项目映射、完整 Session ID 和每页 5 条分页；
 - `/desktop` 列表的运行中、失败和空闲状态文本；
 - Session 完成通知的持久去重、失败重试和一键连接按钮；
+- 仅主线程自身完成产生通知；覆盖嵌套/JSON 来源、父线程标志、错误 rollout 映射、
+  子任务复制的根历史、旧子任务 outbox 重试、元数据不完整时暂缓与恢复；
+- 子 Agent 状态的 snapshot、canonical 历史、patch 与 rollout 基线投影；每轮去重、
+  插入/删除后的 patch 索引更新、历史隔离、白名单字段与未知活动安全降级；
+- `completed -> interacted` 不猜测运行状态，依据子线程自己的 ordinal 边界后的
+  启动/完成/失败/中断记录确认；半行、超长记录、身份错配和扫描超限显示待同步；
+- 子状态定时刷新不改父状态、不发送通知、继续复用原卡；慢文件读取不能丢失并发
+  IPC 增量，重复启动不会创建多个轮询任务，关闭时必须回收；
 - 成功/失败完成提醒仅由 `NEXT / 重新连接` 整块区域承接 `desktop_attach`，不再出现
   下方的“连接此 Session”按钮；缺失有效 ID 时无连接回调，列表高亮区域保持非交互；
 - 长连接卡片按 turn 展示 Query/进度及历史翻页，翻页状态按 chat 隔离，历史轮隐藏 live pending/停止操作，成功发送后立即回到最新轮；
@@ -78,3 +88,7 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
 10. 分别从 `/desktop` 列表和完成提醒点击连接，确认当前卡片原地变成实时会话卡、
     后续更新仍落在同一消息；重启客户端后再次点击旧完成提醒验证消息反查恢复。
 11. Desktop 升级后先重复只读联调；协议不兼容时禁止写操作。
+12. 主任务运行时启动多个子 Agent，确认详情状态区可展开且按本轮展示；子任务逐个
+    完成时仅状态计数变化，不弹主任务完成提醒。主任务最后完成时只收到一次提醒。
+13. 再次使用同一子 Agent，确认不会因 `interacted` 直接沿用旧“已完成”；检查失败、
+    中断与状态暂不可读的文案。切换历史轮后，不应混入该子 Agent 后续新轮的状态。

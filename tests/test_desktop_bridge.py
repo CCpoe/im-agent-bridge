@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import sqlite3
 from pathlib import Path
@@ -1369,3 +1370,207 @@ async def test_detach_cancels_pending_card_flush(tmp_path):
     assert len(cards.updated) == before
     assert "chat-1" not in cards.active
     await bridge.close()
+
+
+@pytest.mark.parametrize("marker", [
+    {"source": "subAgentThreadSpawn"},
+    {"source": {"subagent": {"thread_spawn": {"parent_thread_id": "root"}}}},
+    {"source": json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": "root"}}})},
+    {"thread_source": "subagent"},
+    {"threadSource": "subagent"},
+    {"parent_thread_id": "root"},
+])
+def test_catalog_rejects_structured_subagent_sources(tmp_path, marker):
+    bridge = manager(tmp_path)
+    path = tmp_path / "child.jsonl"
+    path.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "child-1", "originator": "Codex Desktop", **marker},
+    }) + "\n")
+    rows = [{"id": "child-1", "path": str(path), "source": "vscode"}]
+    for archived in (False, True):
+        assert bridge._normalize_catalog_rows(rows, archived=archived, include_internal=True) == []
+        assert bridge._normalize_catalog_rows(
+            [{"id": "child-1", **marker}], archived=archived, include_internal=True,
+        ) == []
+
+
+def test_catalog_rejects_root_row_pointing_to_another_rollout(tmp_path):
+    path = tmp_path / "child.jsonl"
+    path.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "child-1", "session_id": "root-1", "originator": "Codex Desktop"},
+    }) + "\n")
+    assert manager(tmp_path)._normalize_catalog_rows(
+        [{"id": "root-1", "path": str(path), "source": "vscode"}],
+        archived=False, include_internal=True,
+    ) == []
+
+
+def test_rollout_metadata_never_aliases_child_session_id_to_root(tmp_path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    path = sessions / "rollout-test-root-1.jsonl"
+    path.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {
+            "id": "child-1", "session_id": "root-1", "originator": "Codex Desktop",
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "root-1"}}},
+        },
+    }) + "\n")
+    bridge = manager(tmp_path)
+    assert bridge._rollout_metadata({"root-1"}) == {}
+    assert bridge._seed_state_from_rollout("root-1")["status"] == "unknown"
+
+
+def _subagent_activity(turn_id, kind, *, root="thread-1", child="child-1"):
+    return {"type": "event_msg", "payload": {
+        "type": "item_completed", "thread_id": root, "turn_id": turn_id,
+        "item": {
+            "type": "SubAgentActivity", "id": "activity-" + kind,
+            "agent_thread_id": child, "agent_path": "/root/check", "kind": kind,
+            "prompt": "PRIVATE_PROMPT", "output": "PRIVATE_OUTPUT",
+        },
+    }}
+
+
+def test_rollout_subagents_stay_in_parent_turn_and_do_not_complete_parent(tmp_path, monkeypatch):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    records = [
+        {"type": "session_meta", "payload": {"id": "thread-1"}},
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-old"}},
+        _subagent_activity("turn-old", "started"),
+        _subagent_activity("turn-old", "completed"),
+        {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-old"}},
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-live"}},
+        _subagent_activity("turn-live", "interacted"),
+        _subagent_activity("turn-live", "completed", root="another-root", child="foreign-child"),
+    ]
+    (sessions / "rollout-test-thread-1.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+    bridge = manager(tmp_path)
+    monkeypatch.setattr(bridge._subagent_status_reader, "get_status", lambda *args: "running")
+    state = bridge._seed_state_from_rollout("thread-1")
+    assert state["status"] == "running"
+    assert state["active_turn_id"] == "turn-live"
+    assert state["turns"][0]["sub_agents"] == [{
+        "thread_id": "child-1", "agent_path": "/root/check", "status": "completed",
+    }]
+    assert state["turns"][1]["sub_agents"] == [{
+        "thread_id": "child-1", "agent_path": "/root/check", "status": "running",
+    }]
+    rendered = json.dumps(state)
+    assert "PRIVATE_" not in rendered
+    assert "foreign-child" not in rendered
+
+
+def _subagent_parent_state():
+    return {
+        "schema_version": 1, "schema_known": True, "thread_id": "thread-1",
+        "title": "主任务", "status": "running", "active_turn_id": "turn-live",
+        "messages": [], "pending": None,
+        "turns": [{
+            "turn_id": turn_id, "status": status,
+            "user_messages": [], "agent_messages": [],
+            "sub_agents": [{"thread_id": "child-1", "agent_path": "/root/check", "status": status}],
+        } for turn_id, status in (("turn-old", "completed"), ("turn-live", "running"))],
+    }
+
+
+@pytest.mark.parametrize("child_status", ["running", "completed", "failed", "interrupted", None])
+def test_child_status_enrichment_is_latest_only_and_does_not_mutate_parent(tmp_path, monkeypatch, child_status):
+    bridge = manager(tmp_path)
+    monkeypatch.setattr(bridge._subagent_status_reader, "get_status", lambda *args: child_status)
+    original = _subagent_parent_state()
+    saved = copy.deepcopy(original)
+    enriched = bridge._with_subagent_statuses(original)
+    assert original == saved
+    assert enriched["status"] == "running"
+    assert enriched["active_turn_id"] == "turn-live"
+    assert enriched["turns"][0]["sub_agents"][0]["status"] == "completed"
+    assert enriched["turns"][1]["sub_agents"][0]["status"] == (child_status or "unknown")
+
+
+@pytest.mark.asyncio
+async def test_child_completion_refresh_reuses_cards_and_never_sends_notification(tmp_path, monkeypatch):
+    cards = FakeCardService()
+    bridge = manager(tmp_path, cards=cards)
+    bridge._bindings = {"history-chat": "thread-1", "live-chat": "thread-1"}
+    bridge._turn_views = {"history-chat": "turn-old"}
+    bridge._states["thread-1"] = _subagent_parent_state()
+    for chat_id in bridge._bindings:
+        cards.active[chat_id] = CardState(card_id=chat_id, message_id=chat_id)
+    monkeypatch.setattr(bridge._subagent_status_reader, "get_status", lambda *args: "failed")
+    await bridge._refresh_subagent_states()
+    assert len(cards.updated) == 2
+    assert cards.created == cards.sent == cards.user_cards == []
+    state = bridge._states["thread-1"]
+    assert state["status"] == "running"
+    assert state["turns"][0]["sub_agents"][0]["status"] == "completed"
+    assert state["turns"][1]["sub_agents"][0]["status"] == "failed"
+    rendered = {card_id: json.dumps(card, ensure_ascii=False) for card_id, _, card in cards.updated}
+    assert "check · 已完成" in rendered["history-chat"]
+    assert "check · 异常" not in rendered["history-chat"]
+    assert "check · 异常" in rendered["live-chat"]
+    await bridge._refresh_subagent_states()
+    assert len(cards.updated) == 2
+
+
+@pytest.mark.asyncio
+async def test_subagent_refresh_task_is_singleton_and_closes(tmp_path):
+    bridge = manager(tmp_path)
+    bridge._started = True
+    bridge._bindings = {"chat-1": "thread-1"}
+    bridge._states["thread-1"] = _subagent_parent_state()
+    bridge._ensure_subagent_refresh_started()
+    task = bridge._subagent_refresh_task
+    assert task is not None
+    bridge._ensure_subagent_refresh_started()
+    assert bridge._subagent_refresh_task is task
+    await bridge.close()
+    assert task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reasoning_only", [False, True])
+async def test_slow_subagent_lookup_cannot_drop_concurrent_ipc_patch(tmp_path, monkeypatch, reasoning_only):
+    bridge = manager(tmp_path)
+    bridge._bindings = {"chat-1": "thread-1"}
+    bridge._publish_card = AsyncMock(return_value=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def delayed_lookup(function, state):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return dict(state)
+
+    monkeypatch.setattr(bridge_module.asyncio, "to_thread", delayed_lookup)
+    first = asyncio.create_task(bridge._on_state_change(snapshot()))
+    await entered.wait()
+    patch = (
+        {"op": "replace", "path": ["turns", 0, "items", 0, "summary"], "value": ["PRIVATE_REASONING"]}
+        if reasoning_only else
+        {"op": "add", "path": ["turns", 0, "items", 2], "value": {
+            "id": "agent-2", "type": "agentMessage", "phase": "commentary", "text": "后续进度",
+        }}
+    )
+    await bridge._on_state_change({"conversationId": "thread-1", "change": {
+        "type": "patches", "baseRevision": 1, "revision": 2,
+        "patches": [patch],
+    }})
+    release.set()
+    await first
+    state = bridge._states["thread-1"]
+    assert state["revision"] == 2
+    assert [message["text"] for message in state["messages"]] == (
+        ["公开进度"] if reasoning_only else ["公开进度", "后续进度"]
+    )
+    bridge._publish_card.assert_awaited_once()
+    assert bridge._publish_card.await_args.args[1]["revision"] == 2
