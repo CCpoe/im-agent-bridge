@@ -21,6 +21,8 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
 - `/desktop` 列表的项目映射、完整 Session ID 和每页 5 条分页；
 - `/desktop` 列表的运行中、失败和空闲状态文本；
 - Session 完成通知的持久去重、失败重试和一键连接按钮；
+- 成功/失败完成提醒仅由 `NEXT / 重新连接` 整块区域承接 `desktop_attach`，不再出现
+  下方的“连接此 Session”按钮；缺失有效 ID 时无连接回调，列表高亮区域保持非交互；
 - 长连接卡片按 turn 展示 Query/进度及历史翻页，翻页状态按 chat 隔离，历史轮隐藏 live pending/停止操作，成功发送后立即回到最新轮；
 - Desktop 实时卡、任务列表、归档列表和完成通知的 Card JSON 2.0 GPT-style
   Workspace 基础契约：`compact_width=false`、公开摘要、等比分栏、标准折叠箭头，
@@ -29,7 +31,7 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
   次级会话控制的单列顺序；审批/输入中断区位于对话之前，历史轮不出现实时操作；
 - Desktop 输入表单保持 `desktop_input` / `desktop_command__{thread_id}` /
   `desktop_send` 协议，提交按钮补齐 form 语义，普通 callback 位于 form 外；
-- 从 `/desktop` 列表或完成提醒点击“连接 Session”时，原卡片必须被原地更新并成为
+- 从 `/desktop` 列表点击连接或从完成提醒点击 `NEXT / 重新连接` 时，原卡片必须被原地更新并成为
   后续实时更新目标；只有消息映射恢复或 CardKit 更新失败时才允许降级新建一张卡；
 - 从旧版历史卡点击前/后轮或提交表单时，回调 `message_id` 必须使被点击卡先原地升级
   到新版主题并成为活动卡，后续更新不得落到另一张消息；
@@ -63,7 +65,8 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
    再选择一个非关键测试任务。
 3. 验证同一张卡片持续更新，用户 Query、全宽 Codex 回复、折叠进度、轮次导航、
    Composer 和次级控制按单列顺序排列，PC/移动端和浅色/深色模式均可读。
-4. 完成一个成功 turn 并构造一个失败 turn，验证绿/红私聊提醒及“连接此 Session”。
+4. 完成一个成功 turn 并构造一个失败 turn，验证完成/失败提醒的 `NEXT / 重新连接`
+   整块区域可点击，且 Session 详情下方不再出现重复连接按钮。
 5. 在长连接卡片中前后翻轮次，确认每页只有当轮 Query 和当轮 Agent 进度。
 6. 验证 `/desktop` 不含归档任务；在 `/archived` 中分别测试“移出归档”和“恢复并进入”。
 7. 分别验证空闲任务 start、运行中任务 steer、停止、命令审批、文件审批和用户输入；
