@@ -9,12 +9,50 @@ from lark_client.desktop_card import (
     build_desktop_card,
     build_desktop_completion_card,
     build_desktop_list_card,
+    extract_card_image_sources,
     extract_public_events,
     extract_public_turns,
     normalize_conversation_state,
     normalize_desktop_update,
     normalize_patch_only_update,
 )
+
+
+def _walk_card(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_card(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_card(child)
+
+
+def _callback_values(card, action=None):
+    values = []
+    for node in _walk_card(card):
+        behaviors = node.get("behaviors")
+        if not isinstance(behaviors, list):
+            continue
+        for behavior in behaviors:
+            value = behavior.get("value") if isinstance(behavior, dict) else None
+            if not isinstance(value, dict):
+                continue
+            if action is None or value.get("action") == action:
+                values.append(value)
+    return values
+
+
+def _buttons(card, label=None):
+    result = []
+    for node in _walk_card(card):
+        if node.get("tag") != "button":
+            continue
+        text = node.get("text")
+        content = text.get("content") if isinstance(text, dict) else None
+        if label is None or content == label:
+            result.append(node)
+    return result
 
 
 def _snapshot():
@@ -90,6 +128,102 @@ def test_snapshot_normalization_and_card_only_expose_public_agent_messages():
     assert "PRIVATE_TOOL_OUTPUT" not in rendered
     assert "print-secret" not in rendered
     assert "_conversation_state" not in rendered
+
+
+def test_public_markdown_strips_image_targets_and_local_file_links():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].insert(0, {
+        "id": "user-local-link",
+        "type": "userMessage",
+        "content": [{
+            "type": "text",
+            "text": "查看 [配置文件](/Users/private/config.md)",
+        }],
+    })
+    snapshot["turns"][0]["items"].append({
+        "id": "agent-local-image",
+        "type": "agentMessage",
+        "phase": "final_answer",
+        "text": (
+            "预览如下：\n"
+            "![卡片预览](/Users/private/card-preview.png)\n"
+            "[打开本地文件](file:///Users/private/report.md)"
+        ),
+    })
+
+    card = build_desktop_card(normalize_conversation_state(snapshot, retain_raw=False))
+    rendered = json.dumps(card, ensure_ascii=False)
+
+    assert "卡片预览" in rendered
+    assert "配置文件" in rendered
+    assert "打开本地文件" in rendered
+    assert "/Users/private" not in rendered
+    assert "file://" not in rendered
+    assert "![" not in rendered
+
+
+def test_markdown_image_is_retained_for_upload_and_rendered_only_with_img_key():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"][-1] = {
+        "id": "agent-image",
+        "type": "agentMessage",
+        "phase": "final_answer",
+        "text": "结果如下：\n![趋势图](</tmp/codex output/chart.png>)",
+    }
+
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    refs = extract_card_image_sources(normalized)
+    assert refs == [{
+        "source": "/tmp/codex output/chart.png",
+        "alt": "趋势图",
+    }]
+
+    without_upload = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert "/tmp/codex output/chart.png" not in without_upload
+    assert '"tag": "img_combination"' not in without_upload
+
+    with_upload = build_desktop_card(
+        normalized,
+        image_keys={"/tmp/codex output/chart.png": "img_v3_test"},
+    )
+    images = [
+        node for node in _walk_card(with_upload)
+        if node.get("tag") == "img_combination"
+    ]
+    assert images == [{
+        "tag": "img_combination",
+        "combination_mode": "double",
+        "img_list": [{"img_key": "img_v3_test"}],
+        "img_list_length": 1,
+        "corner_radius": "12px",
+        "margin": "12px 0px 0px 0px",
+    }]
+    assert "/tmp/codex output/chart.png" not in json.dumps(with_upload, ensure_ascii=False)
+
+
+def test_remote_markdown_image_is_not_exposed_or_uploaded():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"][-1]["text"] = (
+        "远程图：![外部图片](https://example.invalid/private.png)"
+    )
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+
+    assert extract_card_image_sources(normalized) == []
+    rendered = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert "https://example.invalid" not in rendered
+    assert "外部图片" in rendered
+
+
+def test_markdown_image_path_in_alt_is_redacted():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"][-1]["text"] = (
+        "![/Users/private/photo.png](/Users/private/photo.png)"
+    )
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    rendered = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+
+    assert "/Users/private" not in rendered
+    assert "Codex 生成的图片" in rendered
 
 
 def test_snapshot_envelope_metadata_is_normalized():
@@ -182,13 +316,7 @@ def test_approval_request_sets_waiting_state_and_card_actions():
     assert "等待审批" in rendered
     assert "命令：" in rendered
     assert "SECRET_COMMAND_MUST_NOT_BE_RENDERED" not in rendered
-    actions = [
-        element["behaviors"][0]["value"]
-        for column_set in card["body"]["elements"]
-        if column_set.get("tag") == "column_set"
-        for column in column_set["columns"]
-        for element in column["elements"]
-    ]
+    actions = _callback_values(card, "desktop_approval")
     assert {action["decision"] for action in actions} == {"accept", "decline"}
     assert all(action["action"] == "desktop_approval" for action in actions)
     assert all(action["thread_id"] == "thread-1" for action in actions)
@@ -303,13 +431,278 @@ def test_unknown_schema_fails_closed_without_recursive_text_scraping():
 
 def test_desktop_card_has_send_stop_and_detach_controls():
     normalized = normalize_conversation_state(_snapshot())
-    rendered = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    card = build_desktop_card(normalized)
+    rendered = json.dumps(card, ensure_ascii=False)
 
     assert '"name": "desktop_input"' in rendered
     assert '"name": "desktop_command__thread-1"' in rendered
     assert '"action": "desktop_interrupt"' in rendered
     assert '"turn_id": "turn-1"' in rendered
     assert '"action": "desktop_detach"' in rendered
+    assert '"action": "menu_open"' in rendered
+
+
+@pytest.mark.parametrize("status", [
+    "idle",
+    "running",
+    "waiting_approval",
+    "waiting_input",
+    "completed",
+    "failed",
+    "interrupted",
+    "unknown",
+])
+def test_desktop_card_v2_contract_for_all_states(status):
+    normalized = normalize_conversation_state(_snapshot(), retain_raw=False)
+    normalized["status"] = status
+    normalized["active_turn_id"] = "turn-1" if status in {
+        "running", "waiting_approval", "waiting_input"
+    } else None
+    card = build_desktop_card(normalized)
+    rendered = json.dumps(card, ensure_ascii=False)
+
+    assert card["schema"] == "2.0"
+    assert "header" not in card
+    assert card["config"]["update_multi"] is True
+    assert card["config"]["compact_width"] is False
+    summary = card["config"]["summary"]["content"]
+    assert 8 <= len(summary) <= 60
+    assert _STATUS_LABEL_FOR_TEST[status] in rendered
+    assert "PRIVATE_REASONING" not in rendered
+    assert "PRIVATE_TOOL_OUTPUT" not in rendered
+
+
+_STATUS_LABEL_FOR_TEST = {
+    "idle": "空闲",
+    "running": "运行中",
+    "waiting_approval": "等待审批",
+    "waiting_input": "等待输入",
+    "completed": "已完成",
+    "failed": "异常",
+    "interrupted": "已停止",
+    "unknown": "状态未知",
+}
+
+
+def test_desktop_form_preserves_dispatch_contract_and_controls_stay_outside():
+    card = build_desktop_card(normalize_conversation_state(_snapshot(), retain_raw=False))
+    assert card["body"]["elements"][0]["tag"] == "interactive_container"
+    assert card["body"]["elements"][0]["background_style"] == "codex_canvas"
+    assert card["body"]["elements"][0]["corner_radius"] == "12px"
+    assert card["body"]["elements"][0]["border_color"] == "codex_secondary"
+    assert [element["tag"] for element in card["body"]["elements"]] == [
+        "interactive_container",
+        "hr",
+        "form",
+        "hr",
+        "interactive_container",
+    ]
+    forms = [node for node in _walk_card(card) if node.get("tag") == "form"]
+    assert len(forms) == 1
+    form = forms[0]
+    assert form["name"] == "desktop_input"
+
+    inputs = [node for node in _walk_card(form) if node.get("tag") == "input"]
+    assert [node["name"] for node in inputs] == ["desktop_command__thread-1"]
+    assert inputs[0]["max_length"] == 1000
+
+    submit = _buttons(form, "发送指令")
+    assert len(submit) == 1
+    assert submit[0]["name"] == "desktop_send"
+    assert submit[0]["action_type"] == "form_submit"
+    assert submit[0]["form_action_type"] == "submit"
+    assert submit[0]["form_name"] == "desktop_input"
+    assert _callback_values(form) == []
+    assert not any(
+        node.get("tag") == "form"
+        for node in _walk_card(card["body"]["elements"][0])
+    )
+
+    assert _callback_values(card, "menu_open") == [{"action": "menu_open"}]
+    assert _callback_values(card, "desktop_interrupt") == [{
+        "action": "desktop_interrupt",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+    }]
+    assert _callback_values(card, "desktop_detach") == [{
+        "action": "desktop_detach",
+        "thread_id": "thread-1",
+    }]
+
+
+@pytest.mark.parametrize(("status", "has_stop"), [
+    ("idle", False),
+    ("running", True),
+    ("waiting_approval", True),
+    ("waiting_input", True),
+    ("completed", False),
+    ("failed", False),
+    ("interrupted", False),
+    ("unknown", False),
+])
+def test_live_status_matrix_controls(status, has_stop):
+    normalized = normalize_conversation_state(_snapshot(), retain_raw=False)
+    normalized["status"] = status
+    normalized["active_turn_id"] = "turn-1" if has_stop else None
+    card = build_desktop_card(normalized)
+
+    assert bool(_callback_values(card, "desktop_interrupt")) is has_stop
+    assert _callback_values(card, "desktop_detach")
+
+
+def test_conversation_card_uses_single_column_copy_and_standard_collapsible_icon():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"].insert(0, {
+        "id": "user-1",
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "请检查项目结构"}],
+    })
+    snapshot["turns"][0]["items"].append({
+        "id": "agent-2",
+        "type": "agentMessage",
+        "phase": "commentary",
+        "text": "继续处理。",
+    })
+    card = build_desktop_card(normalize_conversation_state(snapshot, retain_raw=False))
+
+    for node in _walk_card(card):
+        if node.get("tag") != "column_set":
+            continue
+        for column in node["columns"]:
+            if column.get("width") == "weighted":
+                assert column.get("weight") == 1
+
+    panels = [node for node in _walk_card(card) if node.get("tag") == "collapsible_panel"]
+    assert len(panels) == 1
+    header = panels[0]["header"]
+    assert header["icon"] == {
+        "tag": "standard_icon",
+        "token": "down_outlined",
+        "color": "grey",
+    }
+    assert header["icon_position"] == "right"
+    assert header["icon_expanded_angle"] == -180
+
+    rendered = json.dumps(card, ensure_ascii=False)
+    assert "Workspace" not in rendered
+    assert "ASSISTANT / LIVE OUTPUT" not in rendered
+    assert "YOU / TASK CONTEXT" not in rendered
+    shell = card["body"]["elements"][0]["elements"]
+    user_index = next(
+        index for index, node in enumerate(shell)
+        if node.get("tag") == "interactive_container"
+        and "你" in json.dumps(node, ensure_ascii=False)
+    )
+    codex_index = next(
+        index for index, node in enumerate(shell)
+        if node.get("tag") == "markdown"
+        and "Codex</font>" in node.get("content", "")
+    )
+    assert user_index < codex_index
+    assert [node["tag"] for node in card["body"]["elements"]] == [
+        "interactive_container",
+        "hr",
+        "form",
+        "hr",
+        "interactive_container",
+    ]
+    assert card["body"]["elements"][-1]["corner_radius"] == "12px"
+    assert card["body"]["elements"][-1]["border_color"] == "codex_secondary"
+    bordered_surfaces = [
+        node for node in _walk_card(card)
+        if node.get("tag") == "interactive_container"
+        and node.get("background_style") in {"codex_body", "codex_button_secondary"}
+    ]
+    assert bordered_surfaces
+    assert all(
+        node.get("has_border") is True
+        and node.get("border_color") == "codex_secondary"
+        for node in bordered_surfaces
+    )
+    assert panels[0]["border"] == {
+        "color": "codex_secondary",
+        "corner_radius": "12px",
+    }
+
+
+def test_all_desktop_builders_use_workspace_foundation_and_final_palette():
+    cards = [
+        build_desktop_card(normalize_conversation_state(_snapshot(), retain_raw=False)),
+        build_desktop_list_card([{
+            "thread_id": "thread-1",
+            "title": "Desktop 会话",
+            "project_name": "测试项目",
+            "status": "running",
+        }]),
+        build_desktop_completion_card({
+            "thread_id": "thread-1",
+            "title": "Desktop 会话",
+            "project_name": "测试项目",
+            "outcome": "completed",
+        }),
+    ]
+
+    for card in cards:
+        assert card["schema"] == "2.0"
+        assert "header" not in card
+        assert card["config"]["compact_width"] is False
+        assert card["config"]["update_multi"] is True
+        assert 8 <= len(card["config"]["summary"]["content"]) <= 60
+        assert card["body"]["padding"] == "0px 0px 0px 0px"
+        assert card["body"]["elements"][0]["background_style"] == "codex_canvas"
+        colors = card["config"]["style"]["color"]
+        assert colors["codex_canvas"]["light_mode"] == "rgba(255,255,255,1)"
+        assert colors["codex_accent"]["light_mode"] == "rgba(203,197,255,1)"
+        assert colors["codex_accent_2"]["light_mode"] == "rgba(198,214,255,1)"
+        assert colors["codex_button"]["light_mode"] == "rgba(57,65,255,1)"
+        assert {
+            name: token["dark_mode"] for name, token in colors.items()
+        } == {
+            "codex_canvas": "rgba(23,23,43,1)",
+            "codex_body": "rgba(31,33,54,1)",
+            "codex_panel": "rgba(38,41,64,1)",
+            "codex_secondary": "rgba(65,70,100,1)",
+            "codex_ink": "rgba(245,246,255,1)",
+            "codex_muted": "rgba(181,185,207,1)",
+            "codex_accent": "rgba(57,52,95,1)",
+            "codex_accent_2": "rgba(45,68,107,1)",
+            "codex_button": "rgba(90,97,255,1)",
+            "codex_button_text": "rgba(255,255,255,1)",
+            "codex_button_secondary": "rgba(37,40,63,1)",
+            "codex_on_accent": "rgba(245,246,255,1)",
+        }
+
+
+def test_pending_interrupt_precedes_conversation_and_history_is_read_only():
+    snapshot = _snapshot()
+    snapshot["turns"].insert(0, {
+        "turnId": "turn-history",
+        "status": "completed",
+        "items": [
+            {"id": "u-old", "type": "userMessage",
+             "content": [{"type": "text", "text": "历史问题"}]},
+            {"id": "a-old", "type": "agentMessage", "phase": "final_answer",
+             "text": "历史回答"},
+        ],
+    })
+    snapshot["requests"] = [{
+        "id": "approval-live",
+        "method": "item/commandExecution/requestApproval",
+        "params": {"turnId": "turn-1", "reason": "需要确认命令"},
+    }]
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+
+    live = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    assert live.index("命令执行审批") < live.index("正在检查项目结构")
+
+    historical = json.dumps(
+        build_desktop_card(normalized, selected_turn_id="turn-history"),
+        ensure_ascii=False,
+    )
+    assert "历史第 1/2 轮" in historical
+    assert "实时同步" not in historical
+    assert '"action": "desktop_approval"' not in historical
+    assert '"action": "desktop_interrupt"' not in historical
 
 
 def test_historical_turn_hides_live_pending_and_interrupt_controls():
@@ -370,7 +763,8 @@ def test_desktop_list_card_uses_thread_ids_for_attach():
     rendered = json.dumps(card, ensure_ascii=False)
 
     assert "Desktop 会话" in rendered
-    assert "🟢 **测试项目**" in rendered
+    assert "**测试项目**" in rendered
+    assert "<font color='codex_muted'>运行中" in rendered
     assert "Session：**Desktop 会话**" in rendered
     assert "Session ID：`thread-1`" in rendered
     assert "目录：`/workspace`" in rendered
@@ -379,31 +773,32 @@ def test_desktop_list_card_uses_thread_ids_for_attach():
     assert '"action": "desktop_list_page"' not in rendered
 
 
-@pytest.mark.parametrize(("status", "icon"), [
-    ("running", "🟢"),
-    ("waiting_approval", "🟢"),
-    ("waiting_input", "🟢"),
-    ("failed", "🔴"),
-    ("idle", "⚪"),
-    ("completed", "⚪"),
-    ("unknown", "⚪"),
-    (None, "⚪"),
+@pytest.mark.parametrize(("status", "label"), [
+    ("running", "运行中"),
+    ("waiting_approval", "等待审批"),
+    ("waiting_input", "等待输入"),
+    ("failed", "异常"),
+    ("idle", "空闲"),
+    ("completed", "已完成"),
+    ("unknown", "状态未知"),
+    (None, "状态未知"),
 ])
-def test_desktop_list_card_uses_runtime_status_not_binding(status, icon):
+def test_desktop_list_card_uses_runtime_status_not_binding(status, label):
     card = build_desktop_list_card([{
         "thread_id": "thread-1",
         "title": "同名会话",
         "project_name": "项目甲",
         "status": status,
     }], current_thread_id="thread-1")
-    details = card["body"]["elements"][0]["columns"][0]["elements"][0]["content"]
+    rendered = json.dumps(card, ensure_ascii=False)
 
-    assert details.splitlines()[:2] == [
-        f"{icon} **项目甲**",
-        "Session：**同名会话**",
-    ]
-    button = card["body"]["elements"][0]["columns"][1]["elements"][0]
-    assert button["behaviors"][0]["value"]["action"] == "desktop_detach"
+    assert "**项目甲**" in rendered
+    assert "Session：**同名会话**" in rendered
+    assert f"<font color='codex_muted'>{label} · 当前任务</font>" in rendered
+    assert _callback_values(card, "desktop_detach") == [{
+        "action": "desktop_detach",
+        "thread_id": "thread-1",
+    }]
 
 
 def test_desktop_list_card_paginates_five_threads_and_clamps_page():
@@ -424,7 +819,7 @@ def test_desktop_list_card_paginates_five_threads_and_clamps_page():
     assert "Session ID：`thread-4`" in first
     assert "Session ID：`thread-5`" not in first
     assert '"action": "desktop_list_page", "page": 1' in first
-    first_previous = first_card["body"]["elements"][-1]["columns"][1]["elements"][0]
+    first_previous = _buttons(first_card, "上一页")[0]
     assert first_previous["disabled"] is True
     assert "behaviors" not in first_previous
 
@@ -442,7 +837,7 @@ def test_desktop_list_card_paginates_five_threads_and_clamps_page():
     assert "Session ID：`thread-10`" in last
     assert "Session ID：`thread-11`" in last
     assert "Session ID：`thread-9`" not in last
-    last_next = last_card["body"]["elements"][-1]["columns"][3]["elements"][0]
+    last_next = _buttons(last_card, "下一页")[0]
     assert last_next["disabled"] is True
     assert "behaviors" not in last_next
 
@@ -473,7 +868,8 @@ def test_archived_desktop_list_has_restore_and_attach_actions():
     rendered = json.dumps(card, ensure_ascii=False)
 
     assert "Codex Desktop 已归档" in rendered
-    assert "🔴 **项目甲**" in rendered
+    assert "**项目甲**" in rendered
+    assert "<font color='codex_muted'>异常" in rendered
     assert "Session：**已归档任务**" in rendered
     assert '"action": "desktop_unarchive"' in rendered
     assert '"action": "desktop_attach"' in rendered
@@ -482,11 +878,11 @@ def test_archived_desktop_list_has_restore_and_attach_actions():
     assert '"action": "desktop_detach"' not in rendered
 
 
-@pytest.mark.parametrize(("outcome", "template", "label", "icon"), [
-    ("completed", "green", "执行完成", "🟢"),
-    ("failed", "red", "执行失败", "🔴"),
+@pytest.mark.parametrize(("outcome", "label"), [
+    ("completed", "执行完成"),
+    ("failed", "执行失败"),
 ])
-def test_desktop_completion_card_can_reconnect(outcome, template, label, icon):
+def test_desktop_completion_card_can_reconnect(outcome, label):
     card = build_desktop_completion_card({
         "thread_id": "thread-1",
         "title": "会话名称",
@@ -496,9 +892,12 @@ def test_desktop_completion_card_can_reconnect(outcome, template, label, icon):
     })
     rendered = json.dumps(card, ensure_ascii=False)
 
-    assert card["header"]["template"] == template
+    assert "header" not in card
+    assert card["config"]["compact_width"] is False
+    assert card["config"]["summary"]["content"]
     assert label in rendered
-    assert f"{icon} **项目名称**" in rendered
+    assert f"<font color='codex_on_accent'>**{label}**</font>" in rendered
+    assert "**项目名称**" in rendered
     assert "Session：**会话名称**" in rendered
     assert '"action": "desktop_attach"' in rendered
     assert '"thread_id": "thread-1"' in rendered
@@ -677,6 +1076,111 @@ def test_snapshot_projection_indexes_existing_agent_for_later_text_delta():
     assert "_conversation_state" not in updated
 
 
+def test_patch_replacing_markdown_image_drops_stale_image_reference():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"][-1]["text"] = (
+        "旧图：![预览](/tmp/old-preview.png)"
+    )
+    current = normalize_conversation_state(snapshot, retain_raw=False)
+    current["thread_id"] = "thread-1"
+    current["host_id"] = "local"
+    current["revision"] = 8
+    assert extract_card_image_sources(current)
+
+    updated = normalize_patch_only_update(current, _event({
+        "type": "patches",
+        "baseRevision": 8,
+        "revision": 9,
+        "patches": [{
+            "op": "replace",
+            "path": ["turns", 0, "items", 2, "text"],
+            "value": "图片已移除",
+        }],
+    }))
+
+    assert extract_card_image_sources(updated) == []
+    assert "/tmp/old-preview.png" not in json.dumps(
+        build_desktop_card(updated), ensure_ascii=False
+    )
+
+
+def test_patch_removing_structured_images_drops_stale_reference():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"][-1]["images"] = [{
+        "source": "/tmp/structured-preview.png",
+        "alt": "结构化图片",
+    }]
+    current = normalize_conversation_state(snapshot, retain_raw=False)
+    current["thread_id"] = "thread-1"
+    current["host_id"] = "local"
+    current["revision"] = 8
+    assert extract_card_image_sources(current)
+
+    updated = normalize_patch_only_update(current, _event({
+        "type": "patches",
+        "baseRevision": 8,
+        "revision": 9,
+        "patches": [{
+            "op": "remove",
+            "path": ["turns", 0, "items", 2, "images"],
+        }],
+    }))
+
+    assert extract_card_image_sources(updated) == []
+
+
+def test_repeated_image_source_renders_once_per_card():
+    snapshot = _snapshot()
+    snapshot["turns"][0]["items"] = [
+        {
+            "id": "agent-{}".format(index),
+            "type": "agentMessage",
+            "phase": "commentary",
+            "text": "进度 {}\n![预览](/tmp/shared-preview.png)".format(index),
+        }
+        for index in range(6)
+    ]
+    normalized = normalize_conversation_state(snapshot, retain_raw=False)
+    card = build_desktop_card(
+        normalized,
+        image_keys={"/tmp/shared-preview.png": "img_v3_shared"},
+    )
+
+    combinations = [
+        node for node in _walk_card(card)
+        if node.get("tag") == "img_combination"
+    ]
+    assert len(combinations) == 1
+    assert combinations[0]["img_list"] == [{"img_key": "img_v3_shared"}]
+
+
+@pytest.mark.parametrize(("count", "mode"), [
+    (1, "double"),
+    (2, "double"),
+    (3, "triple"),
+    (4, "bisect"),
+])
+def test_image_gallery_uses_compact_layout_by_count(count, mode):
+    snapshot = _snapshot()
+    sources = ["/tmp/preview-{}.png".format(index) for index in range(count)]
+    snapshot["turns"][0]["items"][-1]["text"] = "\n".join(
+        "![预览 {}]({})".format(index, source)
+        for index, source in enumerate(sources)
+    )
+    card = build_desktop_card(
+        normalize_conversation_state(snapshot, retain_raw=False),
+        image_keys={source: "img_v3_{}".format(index) for index, source in enumerate(sources)},
+    )
+    combinations = [
+        node for node in _walk_card(card)
+        if node.get("tag") == "img_combination"
+    ]
+
+    assert len(combinations) == 1
+    assert combinations[0]["combination_mode"] == mode
+    assert combinations[0]["img_list_length"] == count
+
+
 def test_card_groups_public_content_by_turn_and_pages_with_stable_turn_ids():
     snapshot = _snapshot()
     snapshot["turns"] = [
@@ -796,7 +1300,7 @@ def test_unknown_selected_turn_falls_back_to_latest_and_unknown_text_does_not_le
         ensure_ascii=False,
     )
     assert "正在检查项目结构" in rendered
-    assert "该轮没有可显示的文本输入" in rendered
+    assert "该轮没有可显示的文本输入" not in rendered
     assert "PRIVATE_UNKNOWN_TEXT" not in rendered
     assert "PRIVATE_IMAGE_URL" not in rendered
 

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import lark_client.desktop_bridge as bridge_module
+from lark_client.card_service import CardState
 from lark_client.desktop_bridge import DesktopBridgeManager
 from lark_client.desktop_ipc import DesktopIPCRemoteError
 
@@ -111,6 +112,9 @@ class FakeCardService:
         self.updated = []
         self.active = {}
         self.user_cards = []
+        self.uploaded_images = []
+        self.message_cards = {}
+        self.reuse_updates_succeed = True
 
     async def create_card(self, content):
         self.created.append(content)
@@ -127,6 +131,21 @@ class FakeCardService:
     async def update_card(self, card_id, sequence, content):
         self.updated.append((card_id, sequence, content))
         return True
+
+    async def update_and_reuse_message_card(self, chat_id, message_id, content):
+        state = self.message_cards.get(message_id)
+        if state is None:
+            return False
+        state.sequence += 1
+        self.updated.append((state.card_id, state.sequence, content))
+        if not self.reuse_updates_succeed:
+            return False
+        self.active[chat_id] = state
+        return True
+
+    async def upload_image(self, path):
+        self.uploaded_images.append(Path(path))
+        return "img_v3_test_%d" % len(self.uploaded_images)
 
     def get_active_card(self, chat_id):
         return self.active.get(chat_id)
@@ -218,6 +237,135 @@ async def test_attach_persists_only_binding_and_updates_one_card(tmp_path):
     assert "conversationState" not in persisted
     assert "PRIVATE_REASONING" not in persisted
 
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_reuses_clicked_card_without_creating_another_message(tmp_path):
+    ipc = FakeIPC()
+    cards = FakeCardService()
+    notification = CardState(
+        card_id="completion-card",
+        message_id="completion-message",
+    )
+    cards.message_cards["completion-message"] = notification
+    bridge = manager(tmp_path, ipc, cards)
+
+    assert await bridge.attach(
+        "chat-1",
+        "user-1",
+        "thread-1",
+        reuse_message_id="completion-message",
+    )
+
+    assert cards.created == []
+    assert cards.sent == []
+    assert cards.updated[0][0:2] == ("completion-card", 1)
+    assert cards.active["chat-1"] is notification
+    assert "公开进度" in json.dumps(cards.updated[0][2], ensure_ascii=False)
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_reuse_failure_falls_back_to_one_new_card(tmp_path):
+    ipc = FakeIPC()
+    cards = FakeCardService()
+    cards.message_cards["completion-message"] = CardState(
+        card_id="completion-card",
+        message_id="completion-message",
+    )
+    cards.reuse_updates_succeed = False
+    bridge = manager(tmp_path, ipc, cards)
+
+    assert await bridge.attach(
+        "chat-1",
+        "user-1",
+        "thread-1",
+        reuse_message_id="completion-message",
+    )
+
+    assert cards.updated[0][0] == "completion-card"
+    assert len(cards.created) == 1
+    assert len(cards.sent) == 1
+    assert cards.active["chat-1"].card_id == "card-1"
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_card_uploads_local_markdown_image_once_and_never_exposes_path(tmp_path):
+    image_path = tmp_path / "generated preview.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+    ipc = FakeIPC()
+    cards = FakeCardService()
+    bridge = manager(tmp_path, ipc, cards)
+    assert await bridge.attach("chat-1", "user-1", "thread-1")
+    bridge._thread_metadata["thread-1"] = {"cwd": str(tmp_path)}
+
+    event = snapshot()
+    event["change"]["conversationState"]["turns"][0]["items"][-1]["text"] = (
+        "已生成：\n![预览图](<{}>)".format(image_path)
+    )
+    await ipc.emit(event)
+
+    rendered = json.dumps(cards.updated[-1][2], ensure_ascii=False)
+    assert cards.uploaded_images == [image_path]
+    assert '"tag": "img_combination"' in rendered
+    assert "img_v3_test_1" in rendered
+    assert str(image_path) not in rendered
+
+    assert await bridge.refresh_card("chat-1")
+    assert cards.uploaded_images == [image_path]
+    await bridge.close()
+
+
+def test_card_image_path_must_remain_inside_thread_cwd(tmp_path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    inside = root / "inside.png"
+    inside.write_bytes(b"image")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"image")
+    escape = root / "escape.png"
+    escape.symlink_to(outside)
+
+    assert bridge_module._resolve_card_image_path(str(inside), str(root)) == inside
+    assert bridge_module._resolve_card_image_path("inside.png", str(root)) == inside
+    assert bridge_module._resolve_card_image_path(str(outside), str(root)) is None
+    assert bridge_module._resolve_card_image_path("../outside.png", str(root)) is None
+    assert bridge_module._resolve_card_image_path(str(escape), str(root)) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_card_refreshes_share_one_image_upload(tmp_path):
+    image_path = tmp_path / "shared.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+    cards = FakeCardService()
+    upload_calls = []
+
+    async def slow_upload(path):
+        upload_calls.append(Path(path))
+        await asyncio.sleep(0.02)
+        return "img_v3_shared"
+
+    cards.upload_image = slow_upload
+    bridge = manager(tmp_path, FakeIPC(), cards)
+    bridge._thread_metadata["thread-1"] = {"cwd": str(tmp_path)}
+    event = snapshot()
+    event["change"]["conversationState"]["turns"][0]["items"][-1]["text"] = (
+        "![共享图片](<{}>)".format(image_path)
+    )
+    state = bridge_module.normalize_conversation_state(
+        event["change"]["conversationState"], retain_raw=False
+    )
+    state["thread_id"] = "thread-1"
+
+    first, second = await asyncio.gather(
+        bridge._image_keys_for_card(state, None),
+        bridge._image_keys_for_card(state, None),
+    )
+
+    assert upload_calls == [image_path]
+    assert first == second == {str(image_path): "img_v3_shared"}
     await bridge.close()
 
 
@@ -948,6 +1096,53 @@ async def test_turn_selection_is_per_chat_and_send_returns_to_latest(tmp_path):
     assert bridge._turn_views == {"chat-2": "turn-1"}
     latest = json.dumps(cards.updated[-1][2], ensure_ascii=False)
     assert "新问题" in latest and "旧问题" not in latest
+
+
+@pytest.mark.asyncio
+async def test_turn_selection_reuses_clicked_historical_card(tmp_path):
+    cards = FakeCardService()
+    bridge = manager(tmp_path, cards=cards)
+    bridge._bindings = {"chat-1": "thread-1"}
+    bridge._states["thread-1"] = {
+        "schema_version": 1,
+        "schema_known": True,
+        "thread_id": "thread-1",
+        "host_id": "local",
+        "revision": 2,
+        "title": "任务",
+        "status": "idle",
+        "active_turn_id": None,
+        "turns": [{
+            "turn_id": "turn-1",
+            "status": "completed",
+            "user_messages": [{"id": "u1", "kind": "initial", "text": "旧问题"}],
+            "agent_messages": [{
+                "id": "a1",
+                "turn_id": "turn-1",
+                "phase": "final_answer",
+                "text": "旧回答",
+            }],
+        }],
+        "messages": [],
+        "pending": None,
+    }
+    historical_card = CardState(
+        card_id="historical-card",
+        message_id="historical-message",
+    )
+    cards.message_cards["historical-message"] = historical_card
+
+    assert await bridge.select_turn(
+        "chat-1",
+        "thread-1",
+        "turn-1",
+        reuse_message_id="historical-message",
+    )
+
+    assert cards.created == []
+    assert cards.sent == []
+    assert cards.updated[0][0:2] == ("historical-card", 1)
+    assert cards.active["chat-1"] is historical_card
 
 
 @pytest.mark.asyncio

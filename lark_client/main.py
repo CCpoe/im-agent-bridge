@@ -188,7 +188,11 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
                 print(f"[Lark] Desktop form 提交: user={user_id[:8]}..., thread={thread_id}")
                 if command_text:
                     asyncio.create_task(handler.forward_to_desktop(
-                        user_id, chat_id, thread_id, command_text
+                        user_id,
+                        chat_id,
+                        thread_id,
+                        command_text,
+                        message_id=message_id,
                     ))
                 return None
             command_text = (form_value.get("command") or "").strip()
@@ -270,6 +274,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
                 chat_id,
                 action_value.get("thread_id", ""),
                 action_value.get("target_turn_id", ""),
+                message_id=message_id,
             ))
             return None
 
@@ -494,6 +499,9 @@ class LarkBot:
             event_handler=event_handler,
             log_level=lark.LogLevel.INFO,
         )
+        # SDK 构造函数会把共享的 Lark logger 重置为 INFO；重新应用本项目配置，
+        # 避免 WARNING/ERROR 模式仍把带临时连接参数的 WebSocket URL 写入日志。
+        logging.getLogger("Lark").setLevel(config.LARK_LOG_LEVEL)
 
         # 代理兼容：检测 SOCKS 代理，按配置决定是否绕过
         proxy_info = urllib.request.getproxies()

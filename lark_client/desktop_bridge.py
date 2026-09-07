@@ -17,12 +17,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import unquote, urlparse
 
 from .card_service import CardState
 from .codex_app_server import CodexAppServerClient
 from .desktop_card import (
     NORMALIZED_VERSION,
     build_desktop_card,
+    extract_card_image_sources,
     normalize_conversation_state,
     normalize_patch_only_update,
 )
@@ -35,6 +37,8 @@ logger = logging.getLogger("DesktopBridge")
 ROLLOUT_SEED_TAIL_BYTES = 8 * 1024 * 1024
 ROLLOUT_QUERY_SCAN_BYTES = 64 * 1024 * 1024
 ROLLOUT_QUERY_LINE_BYTES = 1024 * 1024
+IMAGE_UPLOAD_RETRY_SECONDS = 60.0
+MAX_IMAGE_CACHE_ENTRIES = 128
 
 class DesktopBridgeManager:
     """管理聊天与 Desktop 线程的绑定和实时卡片。"""
@@ -91,6 +95,12 @@ class DesktopBridgeManager:
         self._background_tasks: set[asyncio.Task] = set()
         self._pending_card_states: Dict[str, Mapping[str, Any]] = {}
         self._card_flush_tasks: Dict[str, asyncio.Task] = {}
+        self._image_key_cache: Dict[
+            tuple[str, int, int], tuple[Optional[str], float]
+        ] = {}
+        self._image_upload_tasks: Dict[
+            tuple[str, int, int], asyncio.Task
+        ] = {}
         self._start_lock: Optional[asyncio.Lock] = None
         self._started = False
         self._closed = False
@@ -157,6 +167,12 @@ class DesktopBridgeManager:
             await asyncio.gather(*card_tasks, return_exceptions=True)
         self._card_flush_tasks.clear()
         self._pending_card_states.clear()
+        image_tasks = list(self._image_upload_tasks.values())
+        for task in image_tasks:
+            task.cancel()
+        if image_tasks:
+            await asyncio.gather(*image_tasks, return_exceptions=True)
+        self._image_upload_tasks.clear()
         self.ipc.remove_state_listener(self._on_state_change)
         try:
             await self.ipc.disconnect()
@@ -172,6 +188,7 @@ class DesktopBridgeManager:
         thread_id: str,
         *,
         owner_timeout: Optional[float] = None,
+        reuse_message_id: Optional[str] = None,
     ) -> bool:
         chat_id = str(chat_id).strip()
         thread_id = _clean_thread_id(thread_id)
@@ -208,7 +225,12 @@ class DesktopBridgeManager:
             self._users[chat_id] = str(user_id)
         state = self._states.get(thread_id) or self._seed_state_from_rollout(thread_id)
         self._states[thread_id] = state
-        await self._publish_card(chat_id, state, replace=True)
+        await self._publish_card(
+            chat_id,
+            state,
+            replace=True,
+            reuse_message_id=reuse_message_id,
+        )
         try:
             await self.ipc.follow(thread_id, owner_client_id=owner)
         except Exception:
@@ -256,9 +278,27 @@ class DesktopBridgeManager:
         state = self._states.get(thread_id) if thread_id else None
         return dict(state) if isinstance(state, Mapping) else None
 
-    async def refresh_card(self, chat_id: str) -> bool:
+    def cwd_for_chat(self, chat_id: str) -> Optional[str]:
+        """Return the bound Desktop task cwd for safe file-menu shortcuts."""
+        thread_id = self._bindings.get(chat_id)
+        return self._cwd_for_thread(thread_id) if thread_id else None
+
+    async def refresh_card(
+        self,
+        chat_id: str,
+        *,
+        reuse_message_id: Optional[str] = None,
+    ) -> bool:
         state = self.state_for_chat(chat_id)
-        return await self._publish_card(chat_id, state) if state is not None else False
+        return (
+            await self._publish_card(
+                chat_id,
+                state,
+                reuse_message_id=reuse_message_id,
+            )
+            if state is not None
+            else False
+        )
 
     async def register_notification_target(self, user_id: str) -> bool:
         """Register a Lark user for Desktop turn completion notifications."""
@@ -269,7 +309,12 @@ class DesktopBridgeManager:
         return registered
 
     async def select_turn(
-        self, chat_id: str, expected_thread_id: str, target_turn_id: str
+        self,
+        chat_id: str,
+        expected_thread_id: str,
+        target_turn_id: str,
+        *,
+        reuse_message_id: Optional[str] = None,
     ) -> bool:
         """Select one historical turn for a chat without changing thread state."""
 
@@ -287,7 +332,11 @@ class DesktopBridgeManager:
         ):
             return False
         self._turn_views[chat_id] = target_turn_id
-        return await self._publish_card(chat_id, state)
+        return await self._publish_card(
+            chat_id,
+            state,
+            reuse_message_id=reuse_message_id,
+        )
 
     # -- 线程发现 ------------------------------------------------------
 
@@ -1156,13 +1205,30 @@ class DesktopBridgeManager:
             return False
 
     async def _publish_card(
-        self, chat_id: str, state: Mapping[str, Any], *, replace: bool = False
+        self,
+        chat_id: str,
+        state: Mapping[str, Any],
+        *,
+        replace: bool = False,
+        reuse_message_id: Optional[str] = None,
     ) -> bool:
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
+            selected_turn_id = self._turn_views.get(chat_id)
+            image_keys = await self._image_keys_for_card(state, selected_turn_id)
             content = build_desktop_card(
-                state, selected_turn_id=self._turn_views.get(chat_id)
+                state,
+                selected_turn_id=selected_turn_id,
+                image_keys=image_keys,
             )
+            reuse_card = getattr(
+                self.card_service,
+                "update_and_reuse_message_card",
+                None,
+            )
+            if reuse_message_id and callable(reuse_card):
+                if await reuse_card(chat_id, reuse_message_id, content):
+                    return True
             active = None if replace else self.card_service.get_active_card(chat_id)
             if active is not None:
                 active.sequence += 1
@@ -1183,6 +1249,81 @@ class DesktopBridgeManager:
                 chat_id, CardState(card_id=card_id, message_id=message_id)
             )
             return True
+
+    async def _image_keys_for_card(
+        self,
+        state: Mapping[str, Any],
+        selected_turn_id: Optional[str],
+    ) -> Dict[str, str]:
+        uploader = getattr(self.card_service, "upload_image", None)
+        if not callable(uploader):
+            return {}
+        refs = extract_card_image_sources(state, selected_turn_id)
+        if not refs:
+            return {}
+
+        thread_id = _clean_thread_id(state.get("thread_id"))
+        cwd = self._cwd_for_thread(thread_id) if thread_id else os.getcwd()
+        now = time.monotonic()
+        result: Dict[str, str] = {}
+        for ref in refs:
+            source = ref.get("source")
+            path = _resolve_card_image_path(source, cwd)
+            if path is None:
+                continue
+            try:
+                stat_result = path.stat()
+            except OSError:
+                continue
+            cache_key = (str(path), stat_result.st_mtime_ns, stat_result.st_size)
+            cached = self._image_key_cache.get(cache_key)
+            if cached is not None:
+                cached_key, cached_at = cached
+                if cached_key:
+                    result[source] = cached_key
+                    continue
+                if now - cached_at < IMAGE_UPLOAD_RETRY_SECONDS:
+                    continue
+
+            upload_task = self._image_upload_tasks.get(cache_key)
+            if upload_task is None:
+                async def upload_and_cache() -> Optional[str]:
+                    try:
+                        value = await uploader(path)
+                    except Exception as error:
+                        logger.warning(
+                            "卡片图片上传失败，已降级为文字: %s",
+                            type(error).__name__,
+                        )
+                        value = None
+                    value = value if isinstance(value, str) and value else None
+                    self._image_key_cache[cache_key] = (value, time.monotonic())
+                    return value
+
+                upload_task = asyncio.create_task(
+                    upload_and_cache(),
+                    name="desktop-card-image-upload",
+                )
+                self._image_upload_tasks[cache_key] = upload_task
+                upload_task.add_done_callback(
+                    lambda done, key=cache_key: (
+                        self._image_upload_tasks.pop(key, None)
+                        if self._image_upload_tasks.get(key) is done
+                        else None
+                    )
+                )
+            image_key = await asyncio.shield(upload_task)
+            if image_key:
+                result[source] = image_key
+
+        if len(self._image_key_cache) > MAX_IMAGE_CACHE_ENTRIES:
+            oldest = sorted(
+                self._image_key_cache,
+                key=lambda key: self._image_key_cache[key][1],
+            )[: len(self._image_key_cache) - MAX_IMAGE_CACHE_ENTRIES]
+            for key in oldest:
+                self._image_key_cache.pop(key, None)
+        return result
 
     def _schedule_card_publish(
         self, chat_id: str, state: Mapping[str, Any], *, immediate: bool = False
@@ -1497,6 +1638,30 @@ def _resolved_path(value: Any) -> Optional[Path]:
         return None
     try:
         return Path(value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _resolve_card_image_path(value: Any, cwd: str) -> Optional[Path]:
+    """Resolve an image only when it remains inside the current task cwd."""
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        return None
+    source = value.strip()
+    if source.lower().startswith("file://"):
+        parsed = urlparse(source)
+        if parsed.netloc not in {"", "localhost"}:
+            return None
+        source = unquote(parsed.path)
+    elif "://" in source:
+        return None
+    try:
+        root = Path(cwd).expanduser().resolve(strict=True)
+        path = Path(source).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        path = path.resolve(strict=True)
+        path.relative_to(root)
+        return path if path.is_file() else None
     except (OSError, RuntimeError, ValueError):
         return None
 

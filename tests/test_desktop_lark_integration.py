@@ -21,7 +21,9 @@ class FakeDesktop:
         self.archived = False
         self.unarchived = []
         self.turn_pages = []
+        self.refreshed = []
         self.attach_kwargs = []
+        self.cwd = None
 
     async def start(self):
         self.started = True
@@ -35,6 +37,9 @@ class FakeDesktop:
 
     def state_for_chat(self, chat_id):
         return None
+
+    def cwd_for_chat(self, chat_id):
+        return self.cwd
 
     def list_threads(self, limit=20):
         self.list_limits.append(limit)
@@ -55,8 +60,12 @@ class FakeDesktop:
         self.archived = False
         return True
 
-    async def select_turn(self, chat_id, expected_thread_id, target_turn_id):
-        self.turn_pages.append((chat_id, expected_thread_id, target_turn_id))
+    async def select_turn(self, chat_id, expected_thread_id, target_turn_id, **kwargs):
+        self.turn_pages.append((chat_id, expected_thread_id, target_turn_id, kwargs))
+        return True
+
+    async def refresh_card(self, chat_id, **kwargs):
+        self.refreshed.append((chat_id, kwargs))
         return True
 
     async def send_message(self, chat_id, text, client_message_id=None):
@@ -108,6 +117,41 @@ async def test_plain_message_routes_to_attached_desktop(monkeypatch):
     await handler.handle_message("user-1", "chat-1", "继续执行", chat_type="p2p")
 
     assert desktop.sent == [("chat-1", "继续执行", None)]
+
+
+@pytest.mark.parametrize(("label", "command"), [
+    ("任务列表", "/desktop"),
+    ("当前状态", "/desktop-status"),
+    ("归档任务", "/archived"),
+    ("停止任务", "/desktop-stop"),
+    ("断开任务", "/desktop-detach"),
+    ("文件列表", "/ls"),
+    ("目录树", "/tree"),
+    ("使用帮助", "/help"),
+    ("主菜单", "/menu"),
+])
+@pytest.mark.asyncio
+async def test_custom_menu_labels_route_as_commands(label, command):
+    handler = make_handler(FakeDesktop(attached=True))
+    handler._handle_command = AsyncMock()
+
+    await handler.handle_message("user-1", "chat-1", label, chat_type="p2p")
+
+    handler._handle_command.assert_awaited_once_with("user-1", "chat-1", command)
+
+
+@pytest.mark.asyncio
+async def test_file_menu_uses_bound_desktop_task_cwd(tmp_path):
+    desktop = FakeDesktop(attached=True)
+    desktop.cwd = str(tmp_path)
+    handler = make_handler(desktop)
+    handler._collect_ls_entries = MagicMock(return_value=[])
+    handler._send_or_update_card = AsyncMock()
+
+    await handler._cmd_ls("user-1", "chat-1", "")
+
+    handler._collect_ls_entries.assert_called_once_with(tmp_path)
+    handler._send_or_update_card.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -186,6 +230,23 @@ async def test_archived_session_is_unarchived_before_attach(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_card_attach_passes_clicked_message_for_in_place_reuse(monkeypatch):
+    desktop = FakeDesktop()
+    handler = make_handler(desktop)
+    monkeypatch.setattr(handler_module.sys, "platform", "linux")
+
+    await handler._cmd_desktop_attach(
+        "user-1",
+        "chat-1",
+        "thread-1",
+        message_id="completion-message",
+    )
+
+    assert desktop.attached_threads == [("chat-1", "user-1", "thread-1")]
+    assert desktop.attach_kwargs == [{"reuse_message_id": "completion-message"}]
+
+
+@pytest.mark.asyncio
 async def test_desktop_attach_loads_cold_task_with_bundle_id_and_retries(monkeypatch):
     desktop = FakeDesktop()
     desktop.attach = AsyncMock(side_effect=[False, False, True])
@@ -196,7 +257,12 @@ async def test_desktop_attach_loads_cold_task_with_bundle_id_and_retries(monkeyp
     monkeypatch.setattr(handler_module.subprocess, "Popen", popen)
     monkeypatch.setattr(handler_module.asyncio, "sleep", sleep)
 
-    await handler._cmd_desktop_attach("user-1", "chat-1", "thread-cold")
+    await handler._cmd_desktop_attach(
+        "user-1",
+        "chat-1",
+        "thread-cold",
+        message_id="completion-message",
+    )
 
     assert desktop.attach.await_count == 3
     assert [call.args for call in desktop.attach.await_args_list] == [
@@ -205,9 +271,9 @@ async def test_desktop_attach_loads_cold_task_with_bundle_id_and_retries(monkeyp
         ("chat-1", "user-1", "thread-cold"),
     ]
     assert [call.kwargs for call in desktop.attach.await_args_list] == [
-        {"owner_timeout": 0.75},
-        {"owner_timeout": 0.75},
-        {"owner_timeout": 0.75},
+        {"owner_timeout": 0.75, "reuse_message_id": "completion-message"},
+        {"owner_timeout": 0.75, "reuse_message_id": "completion-message"},
+        {"owner_timeout": 0.75, "reuse_message_id": "completion-message"},
     ]
     assert [call.args[0] for call in sleep.await_args_list] == [1.0, 2.0]
     popen.assert_called_once_with(
@@ -251,9 +317,39 @@ async def test_desktop_turn_page_routes_to_bound_thread():
     desktop = FakeDesktop(attached=True)
     handler = make_handler(desktop)
 
-    await handler.handle_desktop_turn_page("chat-1", "thread-1", "turn-old")
+    await handler.handle_desktop_turn_page(
+        "chat-1",
+        "thread-1",
+        "turn-old",
+        message_id="historical-message",
+    )
 
-    assert desktop.turn_pages == [("chat-1", "thread-1", "turn-old")]
+    assert desktop.turn_pages == [(
+        "chat-1",
+        "thread-1",
+        "turn-old",
+        {"reuse_message_id": "historical-message"},
+    )]
+
+
+@pytest.mark.asyncio
+async def test_desktop_form_reuses_clicked_historical_card_before_sending():
+    desktop = FakeDesktop(attached=True)
+    handler = make_handler(desktop)
+
+    await handler.forward_to_desktop(
+        "user-1",
+        "chat-1",
+        "thread-1",
+        "继续处理",
+        message_id="historical-message",
+    )
+
+    assert desktop.refreshed == [(
+        "chat-1",
+        {"reuse_message_id": "historical-message"},
+    )]
+    assert desktop.sent == [("chat-1", "继续处理", None)]
 
 
 @pytest.mark.asyncio

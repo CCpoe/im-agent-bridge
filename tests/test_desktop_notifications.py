@@ -146,18 +146,21 @@ async def test_monitor_skips_history_then_notifies_each_new_completion(tmp_path)
     assert len(cards.calls) == 1
     user_id, card, message_uuid = cards.calls[0]
     assert user_id == "user-1"
-    assert card["header"]["template"] == "green"
-    assert "连接此 Session" in json.dumps(card, ensure_ascii=False)
+    rendered = json.dumps(card, ensure_ascii=False)
+    assert "<font color='codex_on_accent'>**执行完成**</font>" in rendered
+    assert card["config"]["summary"]["content"]
+    assert "连接此 Session" in rendered
     assert len(message_uuid) == 36
 
     with rollout.open("a") as target:
         target.write(_line({"type": "task_started", "turn_id": "turn-2"}))
         target.write(_line({
             "type": "task_complete", "turn_id": "turn-2", "error": {},
-        }))
+    }))
     assert await monitor.poll_once() == 1
-    assert cards.calls[-1][1]["header"]["template"] == "red"
-    assert "执行失败" in json.dumps(cards.calls[-1][1], ensure_ascii=False)
+    failed_card = json.dumps(cards.calls[-1][1], ensure_ascii=False)
+    assert "<font color='codex_on_accent'>**执行失败**</font>" in failed_card
+    assert "执行失败" in failed_card
 
     restarted_cards = FakeCardService()
     restarted = DesktopCompletionMonitor(
@@ -342,7 +345,9 @@ async def test_monitor_streams_completion_record_larger_than_sixteen_megabytes(t
 
     assert await monitor.poll_once() == 1
     assert len(cards.calls) == 1
-    assert cards.calls[0][1]["header"]["template"] == "green"
+    rendered = json.dumps(cards.calls[0][1], ensure_ascii=False)
+    assert "<font color='codex_on_accent'>**执行完成**</font>" in rendered
+    assert cards.calls[0][1]["config"]["summary"]["content"]
 
 
 def test_notification_state_file_is_private(tmp_path):
@@ -357,7 +362,7 @@ def test_notification_state_file_is_private(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_private_notification_uses_open_id_uuid_and_preserves_active_card():
+async def test_private_notification_uses_open_id_uuid_preserves_active_and_tracks_message():
     captured = []
 
     class MessageAPI:
@@ -387,4 +392,92 @@ async def test_private_notification_uses_open_id_uuid_and_preserves_active_card(
     assert captured[0].request_body.receive_id == "open-user-1"
     assert captured[0].request_body.uuid == "stable-message-uuid"
     assert service.get_active_card("chat-1").card_id == "active-card"
-    assert service._cards_by_message_id == {}
+    assert service._cards_by_message_id["message-1"].card_id == "notification-card"
+    assert service._cards_by_message_id["message-1"].message_id == "message-1"
+
+
+@pytest.mark.asyncio
+async def test_notification_card_is_promoted_only_after_successful_update():
+    service = CardService.__new__(CardService)
+    existing = CardState(card_id="active-card", message_id="active-message")
+    notification = CardState(card_id="notification-card", message_id="notification-message")
+    service.client = SimpleNamespace()
+    service._active_cards = {"chat-1": existing}
+    service._cards_by_message_id = {"notification-message": notification}
+    service.update_card = AsyncMock(return_value=False)
+
+    assert not await service.update_and_reuse_message_card(
+        "chat-1", "notification-message", {"schema": "2.0"}
+    )
+    assert service.get_active_card("chat-1") is existing
+
+    service.update_card = AsyncMock(return_value=True)
+    assert await service.update_and_reuse_message_card(
+        "chat-1", "notification-message", {"schema": "2.0"}
+    )
+    assert service.get_active_card("chat-1") is notification
+
+
+@pytest.mark.asyncio
+async def test_old_notification_card_is_recovered_by_message_id_after_restart():
+    class MessageAPI:
+        def get(self, request):
+            assert request.message_id == "notification-message"
+            item = SimpleNamespace(
+                message_id="notification-message",
+                chat_id="chat-1",
+                body=SimpleNamespace(content=json.dumps({
+                    "type": "card",
+                    "data": {"card_id": "notification-card"},
+                })),
+            )
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(items=[item]),
+            )
+
+    service = CardService.__new__(CardService)
+    service.client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=MessageAPI()))
+    )
+    service._active_cards = {}
+    service._cards_by_message_id = {}
+    service.update_card = AsyncMock(return_value=True)
+
+    assert await service.update_and_reuse_message_card(
+        "chat-1", "notification-message", {"schema": "2.0"}
+    )
+    assert service.get_active_card("chat-1").card_id == "notification-card"
+    assert service._cards_by_message_id["notification-message"].sequence > 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_notification_card_must_belong_to_callback_chat():
+    class MessageAPI:
+        def get(self, request):
+            item = SimpleNamespace(
+                message_id="notification-message",
+                chat_id="different-chat",
+                body=SimpleNamespace(content=json.dumps({
+                    "type": "card",
+                    "data": {"card_id": "notification-card"},
+                })),
+            )
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(items=[item]),
+            )
+
+    service = CardService.__new__(CardService)
+    service.client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=MessageAPI()))
+    )
+    service._active_cards = {}
+    service._cards_by_message_id = {}
+    service.update_card = AsyncMock(return_value=True)
+
+    assert not await service.update_and_reuse_message_card(
+        "chat-1", "notification-message", {"schema": "2.0"}
+    )
+    service.update_card.assert_not_awaited()
+    assert service._active_cards == {}
