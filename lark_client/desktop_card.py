@@ -28,6 +28,8 @@ MAX_PUBLIC_TURNS = 20
 MAX_CARD_MESSAGES = 6
 MAX_CARD_MESSAGE_CHARS = 1_500
 MAX_CARD_QUERY_CHARS = 1_500
+MAX_PUBLIC_IMAGES = 8
+MAX_CARD_IMAGES = 4
 DESKTOP_LIST_PAGE_SIZE = 5
 
 _PUBLIC_AGENT_PHASES = {None, "commentary", "final_answer"}
@@ -53,24 +55,16 @@ _STATUS_LABELS = {
     "unknown": "状态未知",
 }
 
-_STATUS_TEMPLATES = {
-    "idle": "grey",
-    "running": "blue",
-    "waiting_approval": "orange",
-    "waiting_input": "orange",
-    "completed": "green",
-    "failed": "red",
-    "interrupted": "grey",
-    "unknown": "grey",
+_STATUS_NOTICES = {
+    "idle": ("任务已连接", "等待下一条指令。"),
+    "running": ("Codex 正在处理", "公开进度会在当前卡片中持续更新。"),
+    "waiting_approval": ("需要你的确认", "处理审批后，当前任务才会继续。"),
+    "waiting_input": ("需要你的输入", "请选择一个选项或继续发送指令。"),
+    "completed": ("当前轮次已完成", "可以继续发送指令开始下一轮。"),
+    "failed": ("当前轮次执行失败", "请查看公开回复后决定是否继续。"),
+    "interrupted": ("当前轮次已停止", "可以继续发送指令重新开始。"),
+    "unknown": ("正在同步任务状态", "状态确认后会自动刷新当前卡片。"),
 }
-
-_LIST_STATUS_ICONS = {
-    "running": "🟢",
-    "waiting_approval": "🟢",
-    "waiting_input": "🟢",
-    "failed": "🔴",
-}
-
 
 class PatchApplyError(ValueError):
     """Raised when an Immer patch cannot be applied safely."""
@@ -88,6 +82,96 @@ def _clean_text(value: Any, limit: int) -> Optional[str]:
     if len(value) > limit:
         return value[: limit - 1].rstrip() + "…"
     return value
+
+
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[([^\]\n]*)\]\(\s*(<[^>\n]+>|[^)\n]+)\s*\)"
+)
+_LOCAL_MARKDOWN_LINK_RE = re.compile(
+    r"\[([^\]]+)\]\((?:file://|/|~)[^\n)]*\)", re.IGNORECASE
+)
+_LOCAL_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+def _safe_image_alt(value: Any) -> str:
+    alt = _clean_text(value, 160) or "Codex 生成的图片"
+    lowered = alt.lower()
+    if lowered.startswith(("file://", "/", "~/", "./", "../")):
+        return "Codex 生成的图片"
+    if re.match(r"^[a-zA-Z]:[\\/]", alt):
+        return "Codex 生成的图片"
+    return alt
+
+
+def _local_image_source(value: Any) -> Optional[str]:
+    """Return a bounded local image reference without exposing it to the card."""
+    if not isinstance(value, str):
+        return None
+    source = value.strip()
+    if source.startswith("<") and source.endswith(">"):
+        source = source[1:-1].strip()
+    if not source or len(source) > 2_048 or "\x00" in source:
+        return None
+    lowered = source.lower()
+    if lowered.startswith(("http://", "https://", "data:")):
+        return None
+    path_part = lowered[7:] if lowered.startswith("file://") else lowered
+    if not path_part.endswith(_LOCAL_IMAGE_SUFFIXES):
+        return None
+    if lowered.startswith("file://") or source.startswith(("/", "~/", "./", "../")):
+        return source
+    # Codex commonly emits project-relative output paths such as
+    # ``outputs/chart.png``.  Other URI schemes remain fail-closed.
+    return source if "://" not in source else None
+
+
+def _sanitize_image_refs(value: Any) -> List[Dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: List[Dict[str, str]] = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        source = _local_image_source(item.get("source"))
+        if source is None or source in seen:
+            continue
+        seen.add(source)
+        result.append({
+            "source": source,
+            "alt": _safe_image_alt(item.get("alt")),
+        })
+        if len(result) >= MAX_PUBLIC_IMAGES:
+            break
+    return result
+
+
+def _public_markdown_payload(value: Any) -> Tuple[Any, List[Dict[str, str]]]:
+    """Strip Markdown image targets while retaining safe in-memory references."""
+    if not isinstance(value, str):
+        return value, []
+    images: List[Dict[str, str]] = []
+    seen = set()
+
+    def replace_image(match: re.Match[str]) -> str:
+        alt = _safe_image_alt(match.group(1))
+        source = _local_image_source(match.group(2))
+        if source is not None and source not in seen and len(images) < MAX_PUBLIC_IMAGES:
+            seen.add(source)
+            images.append({"source": source, "alt": alt})
+        return alt
+
+    text = _MARKDOWN_IMAGE_RE.sub(replace_image, value)
+    text = _LOCAL_MARKDOWN_LINK_RE.sub(
+        lambda match: match.group(1).strip(),
+        text,
+    )
+    return text, images
+
+
+def _public_markdown_text(value: Any) -> Any:
+    """Remove media targets and local-file links from otherwise public text."""
+    return _public_markdown_payload(value)[0]
 
 
 def _identifier(value: Any) -> Optional[str]:
@@ -251,7 +335,7 @@ def _public_text_content(value: Any, limit: int = MAX_PUBLIC_MESSAGE_CHARS) -> O
     for block in value:
         if not isinstance(block, Mapping) or block.get("type") != "text":
             continue
-        text = _clean_text(block.get("text"), limit)
+        text = _clean_text(_public_markdown_text(block.get("text")), limit)
         if text:
             parts.append(text)
     return _clean_text("\n".join(parts), limit) if parts else None
@@ -278,19 +362,31 @@ def _public_user_item(item: Any) -> Optional[Dict[str, str]]:
     }
 
 
-def _public_agent_item(item: Any, turn_id: str = "") -> Optional[Dict[str, str]]:
+def _public_agent_item(item: Any, turn_id: str = "") -> Optional[Dict[str, Any]]:
     if not isinstance(item, Mapping) or item.get("type") != "agentMessage":
         return None
     phase = item.get("phase")
-    text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
+    public_text, parsed_images = _public_markdown_payload(item.get("text"))
+    images = parsed_images + [
+        image
+        for image in _sanitize_image_refs(item.get("images"))
+        if image["source"] not in {existing["source"] for existing in parsed_images}
+    ]
+    images = images[:MAX_PUBLIC_IMAGES]
+    text = _clean_text(public_text, MAX_PUBLIC_MESSAGE_CHARS)
+    if text is None and images:
+        text = images[0]["alt"]
     if phase not in _PUBLIC_AGENT_PHASES or text is None:
         return None
-    return {
+    result: Dict[str, Any] = {
         "id": _identifier(item.get("id")) or "",
         "turn_id": turn_id,
         "phase": phase or "final_answer",
         "text": text,
     }
+    if images:
+        result["images"] = images
+    return result
 
 
 def _normalized_turn_status(value: Any) -> str:
@@ -366,6 +462,7 @@ def _sanitize_public_turn(turn: Any) -> Optional[Dict[str, Any]]:
                 "type": "agentMessage",
                 "phase": message.get("phase") if isinstance(message, Mapping) else None,
                 "text": message.get("text") if isinstance(message, Mapping) else None,
+                "images": message.get("images") if isinstance(message, Mapping) else None,
             }, turn_id)
             if projected is not None:
                 agent_messages.append(projected)
@@ -508,16 +605,15 @@ def extract_public_events(state: Any) -> List[Dict[str, Any]]:
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
-            text = _clean_text(message.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
-            phase = message.get("phase")
-            if text is None or phase not in _PUBLIC_AGENT_PHASES:
-                continue
-            result.append({
-                "id": _identifier(message.get("id")) or "",
-                "turn_id": _identifier(message.get("turn_id")) or "",
-                "phase": phase or "final_answer",
-                "text": text,
-            })
+            projected = _public_agent_item({
+                "id": message.get("id"),
+                "type": "agentMessage",
+                "phase": message.get("phase"),
+                "text": message.get("text"),
+                "images": message.get("images"),
+            }, _identifier(message.get("turn_id")) or "")
+            if projected is not None:
+                result.append(projected)
         return result[-MAX_PUBLIC_MESSAGES:]
 
     return [
@@ -525,6 +621,45 @@ def extract_public_events(state: Any) -> List[Dict[str, Any]]:
         for turn in extract_public_turns(state)
         for message in turn["agent_messages"]
     ][-MAX_PUBLIC_MESSAGES:]
+
+
+def extract_card_image_sources(
+    state: Any, selected_turn_id: Optional[str] = None
+) -> List[Dict[str, str]]:
+    """Return the bounded local images needed by the currently rendered card.
+
+    Sources stay in memory and are consumed by :class:`DesktopBridgeManager` to
+    obtain Lark ``img_key`` values.  They are never copied into the card JSON.
+    """
+    turns = extract_public_turns(state)
+    messages: List[Mapping[str, Any]]
+    if turns:
+        selected = turns[-1]
+        requested = _identifier(selected_turn_id)
+        if requested:
+            selected = next(
+                (turn for turn in turns if turn.get("turn_id") == requested),
+                selected,
+            )
+        messages = selected.get("agent_messages") or []
+    else:
+        messages = extract_public_events(state)
+
+    refs: List[Dict[str, str]] = []
+    seen = set()
+    for message in reversed(messages[-MAX_CARD_MESSAGES:]):
+        if not isinstance(message, Mapping):
+            continue
+        images = _sanitize_image_refs(message.get("images"))
+        for image in reversed(images):
+            source = image["source"]
+            if source in seen:
+                continue
+            seen.add(source)
+            refs.append(image)
+            if len(refs) >= MAX_CARD_IMAGES:
+                return list(reversed(refs))
+    return list(reversed(refs))
 
 
 def _safe_options(value: Any) -> List[Dict[str, str]]:
@@ -984,16 +1119,11 @@ def _upsert_public_item(
 
     item_id = _identifier(item.get("id")) or fallback_id
     if item.get("type") == "agentMessage":
-        phase = item.get("phase")
-        text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
-        if phase not in _PUBLIC_AGENT_PHASES or text is None:
+        projected_agent = _public_agent_item(item, turn_id)
+        if projected_agent is None:
             return
-        projected: Dict[str, str] = {
-            "id": item_id,
-            "turn_id": turn_id,
-            "phase": phase or "final_answer",
-            "text": text,
-        }
+        projected = dict(projected_agent)
+        projected["id"] = item_id
         field = "agent_messages"
     elif item.get("type") in {"userMessage", "steeringUserMessage"}:
         text = _clean_text(item.get("text"), MAX_PUBLIC_MESSAGE_CHARS)
@@ -1155,9 +1285,28 @@ def normalize_patch_only_update(
             elif item_key in patch_items and len(path) == item_offset + 1:
                 field = path[-1]
                 partial = patch_items[item_key]
-                if field in {"id", "type", "phase", "text"}:
+                if field in {"id", "type", "phase", "text", "images"}:
                     if op == "remove":
                         partial.pop(field, None)
+                        if field == "text":
+                            partial.pop("images", None)
+                    elif field == "images":
+                        images = _sanitize_image_refs(value)
+                        if images:
+                            partial["images"] = images
+                        else:
+                            partial.pop("images", None)
+                    elif field == "text" and partial.get("type") == "agentMessage":
+                        public_text, images = _public_markdown_payload(value)
+                        text = _clean_text(public_text, MAX_PUBLIC_MESSAGE_CHARS)
+                        if text is None:
+                            partial.pop("text", None)
+                        else:
+                            partial["text"] = text
+                        if images:
+                            partial["images"] = images
+                        else:
+                            partial.pop("images", None)
                     else:
                         partial[field] = value
                 elif field in {"content", "input"}:
@@ -1224,6 +1373,7 @@ def normalize_patch_only_update(
             "type": "agentMessage",
             "phase": message.get("phase"),
             "text": message.get("text"),
+            "images": message.get("images"),
         }, _identifier(message.get("turn_id")) or "")
         if projected is not None:
             legacy_messages.append(projected)
@@ -1238,28 +1388,655 @@ def normalize_patch_only_update(
     return result
 
 
-def _button(label: str, button_type: str, value: Dict[str, Any]) -> Dict[str, Any]:
+def _summary_content(title: str, status_label: str) -> str:
+    summary = "{}：Codex Desktop {}".format(title, status_label)
+    return _clean_text(summary, 60) or "Codex Desktop 任务状态已更新"
+
+
+def _workspace_config(summary: str) -> Dict[str, Any]:
     return {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": label},
-        "type": button_type,
-        "behaviors": [{"type": "callback", "value": value}],
+        "wide_screen_mode": True,
+        "update_multi": True,
+        "compact_width": False,
+        "enable_forward": False,
+        "enable_forward_interaction": False,
+        "streaming_mode": False,
+        "summary": {"content": _clean_text(summary, 60) or "Codex Desktop 任务状态已更新"},
+        "style": {
+            "color": {
+                "codex_canvas": {
+                    "light_mode": "rgba(255,255,255,1)",
+                    "dark_mode": "rgba(23,23,43,1)",
+                },
+                "codex_body": {
+                    "light_mode": "rgba(247,247,255,1)",
+                    "dark_mode": "rgba(31,33,54,1)",
+                },
+                "codex_panel": {
+                    "light_mode": "rgba(255,255,255,1)",
+                    "dark_mode": "rgba(38,41,64,1)",
+                },
+                "codex_secondary": {
+                    "light_mode": "rgba(215,220,245,1)",
+                    "dark_mode": "rgba(65,70,100,1)",
+                },
+                "codex_ink": {
+                    "light_mode": "rgba(23,23,43,1)",
+                    "dark_mode": "rgba(245,246,255,1)",
+                },
+                "codex_muted": {
+                    "light_mode": "rgba(92,97,120,1)",
+                    "dark_mode": "rgba(181,185,207,1)",
+                },
+                "codex_accent": {
+                    "light_mode": "rgba(203,197,255,1)",
+                    "dark_mode": "rgba(57,52,95,1)",
+                },
+                "codex_accent_2": {
+                    "light_mode": "rgba(198,214,255,1)",
+                    "dark_mode": "rgba(45,68,107,1)",
+                },
+                "codex_button": {
+                    "light_mode": "rgba(57,65,255,1)",
+                    "dark_mode": "rgba(90,97,255,1)",
+                },
+                "codex_button_text": {
+                    "light_mode": "rgba(255,255,255,1)",
+                    "dark_mode": "rgba(255,255,255,1)",
+                },
+                "codex_button_secondary": {
+                    "light_mode": "rgba(247,247,255,1)",
+                    "dark_mode": "rgba(37,40,63,1)",
+                },
+                "codex_on_accent": {
+                    "light_mode": "rgba(23,23,43,1)",
+                    "dark_mode": "rgba(245,246,255,1)",
+                },
+            },
+        },
     }
 
 
-def _button_row(buttons: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def _markdown(
+    content: str,
+    *,
+    text_size: str = "normal",
+    margin: Optional[str] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "tag": "markdown",
+        "content": content,
+        "text_align": "left",
+        "text_size": text_size,
+    }
+    if margin is not None:
+        result["margin"] = margin
+    return result
+
+
+def _message_image_elements(
+    message: Mapping[str, Any],
+    image_keys: Mapping[str, str],
+    rendered_sources: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
+    images: List[Dict[str, str]] = []
+    seen = rendered_sources if rendered_sources is not None else set()
+    for image in _sanitize_image_refs(message.get("images")):
+        source = image["source"]
+        if source in seen or len(seen) >= MAX_CARD_IMAGES:
+            continue
+        img_key = image_keys.get(source)
+        if not isinstance(img_key, str) or not img_key.strip():
+            continue
+        seen.add(source)
+        images.append({
+            "img_key": img_key.strip(),
+        })
+    if not images:
+        return []
+    count = len(images)
+    return [{
+            "tag": "img_combination",
+            "combination_mode": (
+                "double" if count <= 2 else "triple" if count == 3 else "bisect"
+            ),
+            "img_list": images,
+            "img_list_length": count,
+            "corner_radius": "12px",
+            "margin": "12px 0px 0px 0px",
+        }]
+
+
+def _heading(
+    title: str,
+    subtitle: str,
+    tag_label: str,
+) -> List[Dict[str, Any]]:
+    return [
+        _markdown(
+            "<font color='codex_ink'>**{}**</font>".format(
+                _clean_text(title, 60) or "Codex Desktop"
+            ),
+            text_size="heading-2",
+            margin="0px 0px 0px 0px",
+        ),
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "horizontal_spacing": "8px",
+            "horizontal_align": "left",
+            "columns": [{
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "top",
+                "elements": [{
+                    "tag": "interactive_container",
+                    "behaviors": [],
+                    "width": "auto",
+                    "height": "auto",
+                    "corner_radius": "999px",
+                    "has_border": False,
+                    "disabled": False,
+                    "background_style": "codex_button",
+                    "padding": "3px 8px 3px 8px",
+                    "direction": "vertical",
+                    "horizontal_spacing": "0px",
+                    "vertical_spacing": "0px",
+                    "horizontal_align": "center",
+                    "vertical_align": "top",
+                    "elements": [_markdown(
+                        "<font color='codex_button_text'>{}</font>".format(tag_label),
+                        text_size="notation",
+                        margin="0px 0px 0px 0px",
+                    )],
+                }],
+            }, {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "center",
+                "elements": [_markdown(
+                    "<font color='codex_muted'>{}</font>".format(subtitle),
+                    margin="0px 0px 0px 0px",
+                )],
+            }],
+            "margin": "8px 0px 0px 0px",
+        },
+    ]
+
+
+def _surface(
+    elements: Iterable[Dict[str, Any]],
+    *,
+    background: str = "codex_panel",
+    margin: str = "12px 0px 0px 0px",
+    corner_radius: str = "14px",
+    padding: str = "16px 16px 16px 16px",
+) -> Dict[str, Any]:
+    return {
+        "tag": "interactive_container",
+        "behaviors": [],
+        "width": "fill",
+        "height": "auto",
+        "corner_radius": corner_radius,
+        "has_border": True,
+        "border_color": "codex_secondary",
+        "disabled": False,
+        "background_style": background,
+        "padding": padding,
+        "direction": "vertical",
+        "horizontal_spacing": "0px",
+        "vertical_spacing": "0px",
+        "horizontal_align": "left",
+        "vertical_align": "top",
+        "margin": margin,
+        "elements": list(elements),
+    }
+
+
+def _message_surface(elements: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "tag": "interactive_container",
+        "behaviors": [],
+        "width": "fill",
+        "height": "auto",
+        "corner_radius": "14px",
+        "has_border": True,
+        "border_color": "codex_secondary",
+        "disabled": False,
+        "background_style": "codex_body",
+        "padding": "12px 14px 12px 14px",
+        "direction": "vertical",
+        "horizontal_spacing": "0px",
+        "vertical_spacing": "0px",
+        "horizontal_align": "left",
+        "vertical_align": "top",
+        "margin": "16px 0px 0px 0px",
+        "elements": list(elements),
+    }
+
+
+def _status_grid(status: str, context: str, *, historical: bool = False) -> Dict[str, Any]:
+    if historical:
+        title = "历史轮次"
+        detail = "审批、输入和停止操作已隐藏。"
+    else:
+        title, detail = _STATUS_NOTICES[status]
     return {
         "tag": "column_set",
-        "flex_mode": "none",
+        "flex_mode": "stretch",
+        "background_style": "default",
+        "horizontal_spacing": "8px",
+        "horizontal_align": "left",
         "columns": [
-            {"tag": "column", "width": "auto", "elements": [button]}
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": "codex_accent",
+                "padding": "18px 16px 18px 16px",
+                "direction": "vertical",
+                "horizontal_spacing": "0px",
+                "vertical_spacing": "0px",
+                "horizontal_align": "left",
+                "vertical_align": "top",
+                "elements": [
+                    _markdown("<font color='codex_on_accent'>NOW</font>", text_size="notation"),
+                    _markdown(
+                        "<font color='codex_on_accent'>**{}**</font>".format(title),
+                        text_size="heading-2",
+                        margin="6px 0px 0px 0px",
+                    ),
+                    _markdown(
+                        "<font color='codex_on_accent'>{}</font>".format(detail),
+                        text_size="notation",
+                        margin="8px 0px 0px 0px",
+                    ),
+                ],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": "codex_accent_2",
+                "padding": "18px 16px 18px 16px",
+                "direction": "vertical",
+                "horizontal_spacing": "0px",
+                "vertical_spacing": "0px",
+                "horizontal_align": "left",
+                "vertical_align": "top",
+                "elements": [
+                    _markdown("<font color='codex_on_accent'>VIEW</font>", text_size="notation"),
+                    _markdown(
+                        "<font color='codex_on_accent'>**{}**</font>".format(context),
+                        text_size="heading-2",
+                        margin="6px 0px 0px 0px",
+                    ),
+                    _markdown(
+                        "<font color='codex_on_accent'>{}</font>".format(
+                            "Codex Desktop · 历史只读视图"
+                            if historical
+                            else "Codex Desktop · 实时同步"
+                        ),
+                        text_size="notation",
+                        margin="8px 0px 0px 0px",
+                    ),
+                ],
+            },
+        ],
+        "margin": "0px 0px 0px 0px",
+    }
+
+
+def _highlight_grid(
+    left_label: str,
+    left_title: str,
+    left_detail: str,
+    right_label: str,
+    right_title: str,
+    right_detail: str,
+) -> Dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "stretch",
+        "background_style": "default",
+        "horizontal_spacing": "8px",
+        "horizontal_align": "left",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [_surface([
+                    _markdown("<font color='codex_on_accent'>{}</font>".format(left_label),
+                              text_size="notation"),
+                    _markdown("<font color='codex_on_accent'>**{}**</font>".format(left_title),
+                              text_size="heading-2", margin="6px 0px 0px 0px"),
+                    _markdown("<font color='codex_on_accent'>{}</font>".format(left_detail),
+                              text_size="notation", margin="8px 0px 0px 0px"),
+                ], background="codex_accent", margin="0px 0px 0px 0px")],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [_surface([
+                    _markdown("<font color='codex_on_accent'>{}</font>".format(right_label),
+                              text_size="notation"),
+                    _markdown("<font color='codex_on_accent'>**{}**</font>".format(right_title),
+                              text_size="heading-2", margin="6px 0px 0px 0px"),
+                    _markdown("<font color='codex_on_accent'>{}</font>".format(right_detail),
+                              text_size="notation", margin="8px 0px 0px 0px"),
+                ], background="codex_accent_2", margin="0px 0px 0px 0px")],
+            },
+        ],
+        "margin": "0px 0px 0px 0px",
+    }
+
+
+def _footer(content: str, *, margin: str = "20px 0px 0px 0px") -> Dict[str, Any]:
+    return _markdown(
+        "<font color='codex_muted'>{}</font>".format(content),
+        text_size="small",
+        margin=margin,
+    )
+
+
+def _collapsible_digest(
+    title: str,
+    expanded_title: str,
+    elements: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "margin": "12px 0px 0px 0px",
+        "padding": "0px 12px 12px 12px",
+        "background_color": "codex_body",
+        "border": {
+            "color": "codex_secondary",
+            "corner_radius": "12px",
+        },
+        "header": {
+            "title": {"tag": "plain_text", "content": title, "text_align": "left"},
+            "expanded_title": {
+                "tag": "plain_text",
+                "content": expanded_title,
+                "text_align": "left",
+            },
+            "padding": "8px 12px 8px 12px",
+            "width": "fill",
+            "icon": {"tag": "standard_icon", "token": "down_outlined", "color": "grey"},
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "elements": list(elements),
+    }
+
+
+def _workspace_shell(
+    elements: Iterable[Dict[str, Any]],
+    *,
+    padding: str = "18px 20px 18px 20px",
+) -> Dict[str, Any]:
+    return {
+        "tag": "interactive_container",
+        "behaviors": [],
+        "width": "fill",
+        "height": "auto",
+        "corner_radius": "12px",
+        "has_border": True,
+        "border_color": "codex_secondary",
+        "disabled": False,
+        "background_style": "codex_canvas",
+        "padding": padding,
+        "direction": "vertical",
+        "horizontal_spacing": "12px",
+        "vertical_spacing": "12px",
+        "horizontal_align": "left",
+        "vertical_align": "top",
+        "elements": list(elements),
+    }
+
+
+def _theme_control(label: str, value: Dict[str, Any], *, primary: bool = False) -> Dict[str, Any]:
+    return {
+        "tag": "interactive_container",
+        "behaviors": [{"type": "callback", "value": value}],
+        "width": "fill",
+        "height": "auto",
+        "corner_radius": "12px",
+        "has_border": True,
+        "border_color": "codex_secondary",
+        "disabled": False,
+        "background_style": "codex_button" if primary else "codex_button_secondary",
+        "padding": "8px 12px 8px 12px",
+        "direction": "vertical",
+        "horizontal_spacing": "0px",
+        "vertical_spacing": "0px",
+        "horizontal_align": "center",
+        "vertical_align": "top",
+        "elements": [_markdown(
+            "<font color='{}'>{}</font>".format(
+                "codex_button_text" if primary else "codex_ink",
+                label,
+            ),
+            margin="0px 0px 0px 0px",
+        )],
+    }
+
+
+def _theme_control_row(
+    controls: Iterable[Dict[str, Any]],
+    *,
+    margin: str = "20px 0px 0px 0px",
+) -> Dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "stretch",
+        "background_style": "default",
+        "horizontal_spacing": "8px",
+        "horizontal_align": "left",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [control],
+            }
+            for control in controls
+        ],
+        "margin": margin,
+    }
+
+
+def _workspace_pair(
+    output_elements: Iterable[Dict[str, Any]],
+    context_elements: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "stretch",
+        "background_style": "default",
+        "horizontal_spacing": "8px",
+        "horizontal_align": "left",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [_surface(
+                    list(output_elements),
+                    background="codex_panel",
+                    margin="0px 0px 0px 0px",
+                    padding="18px 16px 18px 16px",
+                )],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [_surface(
+                    list(context_elements),
+                    background="codex_body",
+                    margin="0px 0px 0px 0px",
+                    padding="18px 16px 18px 16px",
+                )],
+            },
+        ],
+        "margin": "0px 0px 0px 0px",
+    }
+
+
+def _button_icon(value: Mapping[str, Any]) -> Optional[str]:
+    action = value.get("action")
+    if action == "menu_open":
+        return "menu_outlined"
+    if action == "desktop_interrupt":
+        return "stop_outlined"
+    if action in {"desktop_detach", "list_detach", "stream_detach"}:
+        return "logout_outlined"
+    if action in {"desktop_attach", "stream_reconnect"}:
+        return "arrow_outlined"
+    if action == "desktop_unarchive":
+        return "archive_outlined"
+    if action == "desktop_approval":
+        return "check_outlined" if value.get("decision") == "accept" else "close_outlined"
+    if action == "desktop_turn_page":
+        return "history_outlined"
+    return None
+
+
+def _button(label: str, button_type: str, value: Dict[str, Any]) -> Dict[str, Any]:
+    visual_type = {
+        "primary": "primary_filled",
+        "danger": "danger_filled",
+    }.get(button_type, button_type)
+    result: Dict[str, Any] = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label, "text_align": "left"},
+        "type": visual_type,
+        "size": "medium",
+        "width": "fill",
+        "behaviors": [{"type": "callback", "value": value}],
+    }
+    icon = _button_icon(value)
+    if icon:
+        result["icon"] = {"tag": "standard_icon", "token": icon}
+    return result
+
+
+def _button_row(
+    buttons: Iterable[Dict[str, Any]],
+    *,
+    margin: str = "12px 20px 0px 20px",
+) -> Dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "stretch",
+        "background_style": "default",
+        "horizontal_spacing": "8px",
+        "horizontal_align": "left",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [button],
+            }
             for button in buttons
+        ],
+        "margin": margin,
+    }
+
+
+def _disabled_button(label: str) -> Dict[str, Any]:
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label, "text_align": "left"},
+        "type": "default",
+        "size": "medium",
+        "width": "fill",
+        "disabled": True,
+    }
+
+
+def _desktop_input_form(thread_id: str, *, historical: bool) -> Dict[str, Any]:
+    heading = "继续当前任务" if historical else "继续对话"
+    intro = (
+        "**{}**\n<font color='codex_muted'>输入内容会发送到当前实时任务，而不是改写正在查看的历史轮次。</font>".format(
+            heading
+        )
+        if historical
+        else "**{}**".format(heading)
+    )
+    return {
+        "tag": "form",
+        "name": "desktop_input",
+        "direction": "vertical",
+        "horizontal_spacing": "8px",
+        "vertical_spacing": "8px",
+        "horizontal_align": "left",
+        "vertical_align": "top",
+        "padding": "16px 20px 18px 20px",
+        "margin": "0px 0px 0px 0px",
+        "elements": [
+            _markdown(intro),
+            {
+                "tag": "input",
+                "name": "desktop_command__{}".format(thread_id),
+                "input_type": "multiline_text",
+                "rows": 2,
+                "max_rows": 4,
+                "auto_resize": True,
+                "label": {
+                    "tag": "plain_text",
+                    "content": "给 Codex 发消息",
+                    "text_align": "left",
+                },
+                "label_position": "top",
+                "placeholder": {
+                    "tag": "plain_text",
+                    "content": "输入下一条指令",
+                    "text_align": "left",
+                },
+                "default_value": "",
+                "max_length": 1000,
+                "width": "fill",
+                "required": False,
+                "margin": "6px 0px 0px 0px",
+            },
+            {
+                "tag": "button",
+                "name": "desktop_send",
+                "text": {
+                    "tag": "plain_text",
+                    "content": "发送指令",
+                    "text_align": "left",
+                },
+                "icon": {"tag": "standard_icon", "token": "send_outlined"},
+                "type": "default",
+                "size": "medium",
+                "width": "fill",
+                "action_type": "form_submit",
+                "form_action_type": "submit",
+                "form_name": "desktop_input",
+            },
         ],
     }
 
 
 def build_desktop_card(
-    state: Any, selected_turn_id: Optional[str] = None
+    state: Any,
+    selected_turn_id: Optional[str] = None,
+    image_keys: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build one updateable CardKit 2.0 card from normalized public state."""
     if not isinstance(state, Mapping) or state.get("schema_version") != NORMALIZED_VERSION:
@@ -1268,6 +2045,8 @@ def build_desktop_card(
     status = state.get("status") if state.get("status") in _STATUS_LABELS else "unknown"
     title = _clean_text(state.get("title"), 120) or "Codex Desktop"
     thread_id = _identifier(state.get("thread_id")) or ""
+    image_keys = image_keys if isinstance(image_keys, Mapping) else {}
+    rendered_image_sources: set[str] = set()
     public_turns = extract_public_turns(state)
     selected_index: Optional[int] = None
     selected_turn: Optional[Dict[str, Any]] = None
@@ -1288,17 +2067,25 @@ def build_desktop_card(
         historical_status = selected_turn.get("status")
         if historical_status in _STATUS_LABELS:
             display_status = historical_status
-    elements: List[Dict[str, Any]] = [
-        {
-            "tag": "markdown",
-            "content": "**{}**\n<font color='grey'>{}</font>".format(
-                title, _STATUS_LABELS[display_status]
-            ),
-        }
-    ]
+    historical = not viewing_latest_turn
+    subtitle = "Codex Desktop · {}".format(
+        "历史第 {}/{} 轮".format(selected_index + 1, len(public_turns))
+        if historical and selected_index is not None
+        else "实时同步"
+    )
+    elements: List[Dict[str, Any]] = _heading(
+        title,
+        subtitle,
+        _STATUS_LABELS[display_status],
+    )
+    turn_label = (
+        "第 {}/{} 轮".format(selected_index + 1, len(public_turns))
+        if selected_index is not None
+        else ""
+    )
+    pending_insert_index = len(elements)
 
     if selected_turn is not None:
-        elements.append({"tag": "hr"})
         user_messages = selected_turn["user_messages"]
         if user_messages:
             query_parts: List[str] = []
@@ -1306,92 +2093,131 @@ def build_desktop_card(
                 prefix = "补充指令：" if message["kind"] == "steering" else ""
                 query_parts.append(prefix + message["text"])
             query = _clean_text("\n\n".join(query_parts), MAX_CARD_QUERY_CHARS) or ""
-            elements.append({
-                "tag": "markdown",
-                "content": "**用户 Query**\n{}".format(query),
-            })
-        else:
-            elements.append({
-                "tag": "markdown",
-                "content": "**用户 Query**\n<font color='grey'>该轮没有可显示的文本输入</font>",
-            })
+            elements.append(_message_surface([
+                _markdown("<font color='codex_muted'>你</font>", text_size="notation"),
+                _markdown("**{}**".format(query), margin="6px 0px 0px 0px"),
+            ]))
+
+        elements.append({"tag": "hr", "margin": "18px 0px 0px 0px"})
 
         messages = selected_turn["agent_messages"]
         if messages:
-            elements.append({"tag": "hr"})
-        for message in messages[-MAX_CARD_MESSAGES:]:
-            label = "完成回复" if message["phase"] == "final_answer" else "进度"
+            message = messages[-1]
             text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
-            elements.append({"tag": "markdown", "content": "**{}**\n{}".format(label, text)})
-        if not messages:
-            elements.append({"tag": "markdown", "content": "等待该轮公开进度…"})
+            elements.extend([
+                _markdown("<font color='codex_muted'>Codex</font>", text_size="notation",
+                          margin="16px 0px 0px 0px"),
+                _markdown(text, margin="8px 0px 0px 0px"),
+            ])
+            elements.extend(_message_image_elements(
+                message, image_keys, rendered_image_sources
+            ))
+        else:
+            elements.extend([
+                _markdown("<font color='codex_muted'>Codex</font>", text_size="notation",
+                          margin="16px 0px 0px 0px"),
+                _markdown("**Codex 正在处理**\n\n等待该轮公开进度…",
+                          margin="8px 0px 0px 0px"),
+            ])
+
+        older_messages = messages[-MAX_CARD_MESSAGES:-1]
+        if older_messages:
+            older_elements: List[Dict[str, Any]] = []
+            for message in older_messages:
+                label = "Codex 回复" if message["phase"] == "final_answer" else "执行进度"
+                text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
+                older_elements.append(_markdown("**{}**\n{}".format(label, text)))
+                older_elements.extend(_message_image_elements(
+                    message, image_keys, rendered_image_sources
+                ))
+            elements.append(_collapsible_digest(
+                "较早进度（{}项）".format(len(older_messages)),
+                "收起较早进度（{}项）".format(len(older_messages)),
+                older_elements,
+            ))
 
         if len(public_turns) > 1 and selected_index is not None:
-            previous_button: Dict[str, Any] = {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "← 前一轮"},
-                "type": "default",
-            }
-            next_button: Dict[str, Any] = {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "后一轮 →"},
-                "type": "default",
-            }
+            previous_button: Dict[str, Any]
+            next_button: Dict[str, Any]
             if selected_index == 0:
-                previous_button["disabled"] = True
+                previous_button = _disabled_button("前一轮")
             else:
-                previous_button["behaviors"] = [{
-                    "type": "callback",
-                    "value": {
-                        "action": "desktop_turn_page",
-                        "thread_id": thread_id,
-                        "target_turn_id": public_turns[selected_index - 1]["turn_id"],
-                    },
-                }]
+                previous_button = _button("前一轮", "default", {
+                    "action": "desktop_turn_page",
+                    "thread_id": thread_id,
+                    "target_turn_id": public_turns[selected_index - 1]["turn_id"],
+                })
             if selected_index >= len(public_turns) - 1:
-                next_button["disabled"] = True
+                next_button = _disabled_button("后一轮")
             else:
-                next_button["behaviors"] = [{
-                    "type": "callback",
-                    "value": {
-                        "action": "desktop_turn_page",
-                        "thread_id": thread_id,
-                        "target_turn_id": public_turns[selected_index + 1]["turn_id"],
-                    },
-                }]
-            elements.extend([
-                {"tag": "hr"},
-                {
-                    "tag": "column_set",
-                    "flex_mode": "none",
-                    "horizontal_spacing": "small",
-                    "columns": [
-                        {"tag": "column", "width": "weighted", "weight": 1,
-                         "elements": [{"tag": "markdown", "content": " "}]},
-                        {"tag": "column", "width": "auto", "elements": [previous_button]},
-                        {"tag": "column", "width": "auto", "vertical_align": "center",
-                         "elements": [{"tag": "markdown", "content":
-                                       "第 {}/{} 轮".format(
-                                           selected_index + 1, len(public_turns)
-                                       )}]},
-                        {"tag": "column", "width": "auto", "elements": [next_button]},
-                        {"tag": "column", "width": "weighted", "weight": 1,
-                         "elements": [{"tag": "markdown", "content": " "}]},
-                    ],
-                },
-            ])
+                next_button = _button("后一轮", "default", {
+                    "action": "desktop_turn_page",
+                    "thread_id": thread_id,
+                    "target_turn_id": public_turns[selected_index + 1]["turn_id"],
+                })
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "stretch",
+                "background_style": "default",
+                "horizontal_spacing": "8px",
+                "horizontal_align": "left",
+                "columns": [
+                    {"tag": "column", "width": "weighted", "weight": 1,
+                     "vertical_align": "top", "elements": [previous_button]},
+                    {"tag": "column", "width": "weighted", "weight": 1,
+                     "vertical_align": "center", "elements": [
+                         {
+                             "tag": "markdown",
+                             "content": turn_label,
+                             "text_align": "center",
+                             "text_size": "notation",
+                         }
+                     ]},
+                    {"tag": "column", "width": "weighted", "weight": 1,
+                     "vertical_align": "top", "elements": [next_button]},
+                ],
+                "margin": "12px 0px 0px 0px",
+            })
     else:
         # Compatibility for rollout-derived or older normalized state that only
         # has the original flat ``messages`` field.
         messages = extract_public_events(state)
+        legacy_older_digest: Optional[Dict[str, Any]] = None
         if messages:
-            elements.append({"tag": "hr"})
-            for message in messages[-MAX_CARD_MESSAGES:]:
-                label = "完成回复" if message["phase"] == "final_answer" else "进度"
-                text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
-                elements.append({"tag": "markdown", "content": "**{}**\n{}".format(label, text)})
+            message = messages[-1]
+            text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
+            elements.extend([
+                _markdown("<font color='codex_muted'>Codex</font>", text_size="notation",
+                          margin="16px 0px 0px 0px"),
+                _markdown(text, margin="8px 0px 0px 0px"),
+            ])
+            elements.extend(_message_image_elements(
+                message, image_keys, rendered_image_sources
+            ))
+            older_messages = messages[-MAX_CARD_MESSAGES:-1]
+            if older_messages:
+                older_elements: List[Dict[str, Any]] = []
+                for message in older_messages:
+                    label = "Codex 回复" if message["phase"] == "final_answer" else "执行进度"
+                    text = _clean_text(message["text"], MAX_CARD_MESSAGE_CHARS) or ""
+                    older_elements.append(_markdown("**{}**\n{}".format(label, text)))
+                    older_elements.extend(_message_image_elements(
+                        message, image_keys, rendered_image_sources
+                    ))
+                legacy_older_digest = _collapsible_digest(
+                    "较早进度（{}项）".format(len(older_messages)),
+                    "收起较早进度（{}项）".format(len(older_messages)),
+                    older_elements,
+                )
         else:
-            elements.append({"tag": "markdown", "content": "等待公开进度…"})
+            elements.extend([
+                _markdown("<font color='codex_muted'>Codex</font>", text_size="notation",
+                          margin="16px 0px 0px 0px"),
+                _markdown("**Codex 正在处理**\n\n等待公开进度…",
+                          margin="8px 0px 0px 0px"),
+            ])
+        if legacy_older_digest is not None:
+            elements.append(legacy_older_digest)
 
     pending = state.get("pending")
     if viewing_latest_turn and isinstance(pending, Mapping):
@@ -1399,13 +2225,12 @@ def build_desktop_card(
         kind = _identifier(pending.get("request_kind")) or "unknown"
         prompt = _clean_text(pending.get("prompt"), 600) or "需要处理"
         pending_title = _clean_text(pending.get("title"), 120) or "待处理"
-        elements.extend([
-            {"tag": "hr"},
-            {"tag": "markdown", "content": "**{}**\n{}".format(pending_title, prompt)},
-        ])
+        pending_elements: List[Dict[str, Any]] = [
+            _markdown("<font color='codex_ink'>**{}**</font>\n{}".format(pending_title, prompt)),
+        ]
         details = _clean_text(pending.get("details"), 1000)
         if details:
-            elements.append({"tag": "markdown", "content": details})
+            pending_elements.append(_markdown(details))
         if request_id is not None and pending.get("kind") == "approval":
             base = {
                 "action": "desktop_approval",
@@ -1415,14 +2240,17 @@ def build_desktop_card(
             }
             buttons = []
             if pending.get("allow_remote") is not False:
-                buttons.append(_button("允许", "primary", dict(base, decision="accept")))
-            buttons.append(_button("拒绝", "danger", dict(base, decision="decline")))
-            elements.append(_button_row(buttons))
+                buttons.append(_theme_control(
+                    "允许",
+                    dict(base, decision="accept"),
+                    primary=True,
+                ))
+            buttons.append(_theme_control("拒绝", dict(base, decision="decline")))
+            pending_elements.append(_theme_control_row(buttons))
             if pending.get("allow_remote") is False:
-                elements.append({
-                    "tag": "markdown",
-                    "content": "<font color='grey'>文件变更详情请在 Codex Desktop 中确认；飞书仅支持拒绝。</font>",
-                })
+                pending_elements.append(_markdown(
+                    "<font color='codex_muted'>文件变更详情请在 Codex Desktop 中确认；飞书仅支持拒绝。</font>"
+                ))
         elif request_id is not None and pending.get("kind") == "input":
             options = pending.get("options")
             if isinstance(options, list) and options:
@@ -1433,7 +2261,7 @@ def build_desktop_card(
                     label = _clean_text(option.get("label"), 80)
                     if label is None:
                         continue
-                    buttons.append(_button(label, "default", {
+                    buttons.append(_theme_control(label, {
                         "action": "desktop_input",
                         "thread_id": thread_id,
                         "request_id": request_id,
@@ -1442,16 +2270,19 @@ def build_desktop_card(
                         "answer": label,
                     }))
                 if buttons:
-                    elements.append(_button_row(buttons))
+                    pending_elements.append(_theme_control_row(buttons))
+        elements.insert(
+            pending_insert_index,
+            _surface(pending_elements, background="codex_body"),
+        )
 
+    input_form: Optional[Dict[str, Any]] = None
+    secondary_elements: List[Dict[str, Any]] = []
     if thread_id:
-        elements.extend([
-            {"tag": "hr"},
-            {"tag": "markdown", "content": "<font color='grey'>codex://threads/{}</font>".format(thread_id)},
-        ])
-
+        input_form = _desktop_input_form(thread_id, historical=historical)
         controls = [
-            _button("断开", "default", {
+            _theme_control("打开菜单", {"action": "menu_open"}, primary=True),
+            _theme_control("断开任务", {
                 "action": "desktop_detach",
                 "thread_id": thread_id,
             }),
@@ -1461,43 +2292,45 @@ def build_desktop_card(
             and status in {"running", "waiting_approval", "waiting_input"}
             and state.get("active_turn_id") is not None
         ):
-            controls.insert(0, _button("停止", "danger", {
+            controls.insert(1, _theme_control("停止任务", {
                 "action": "desktop_interrupt",
                 "thread_id": thread_id,
                 "turn_id": state.get("active_turn_id"),
             }))
-        input_form = {
-            "tag": "form",
-            "name": "desktop_input",
-            "elements": [
-                _button_row(controls + [{
-                    "tag": "button",
-                    "name": "desktop_send",
-                    "text": {"tag": "plain_text", "content": "发送 ↵"},
-                    "type": "primary",
-                    "action_type": "form_submit",
-                }]),
-                {
-                    "tag": "input",
-                    "name": "desktop_command__{}".format(thread_id),
-                    "placeholder": {"tag": "plain_text", "content": "向 Desktop 会话发送消息…"},
-                    "width": "fill",
-                },
-            ],
-        }
-        elements.append(input_form)
+        secondary_elements.extend([
+            _theme_control_row(controls, margin="0px 0px 0px 0px"),
+            _footer("IM Agent Bridge · Codex Desktop", margin="6px 0px 0px 0px"),
+        ])
+    else:
+        elements.append(_footer("IM Agent Bridge · Codex Desktop"))
 
     # Construct the result field-by-field.  Never merge the normalized state
     # into it: the private `_conversation_state` may contain sensitive data.
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "Codex Desktop · {}".format(_STATUS_LABELS[display_status])},
-            "subtitle": {"tag": "plain_text", "content": "实时同步"},
-            "template": _STATUS_TEMPLATES[display_status],
+        "config": _workspace_config(_summary_content(title, _STATUS_LABELS[display_status])),
+        "body": {
+            "direction": "vertical",
+            "horizontal_spacing": "0px",
+            "vertical_spacing": "0px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "padding": "0px 0px 0px 0px",
+            "elements": (
+                [_workspace_shell(elements)]
+                + ([
+                    {"tag": "hr", "margin": "0px 20px 0px 20px"},
+                    input_form,
+                ] if input_form else [])
+                + ([
+                    {"tag": "hr", "margin": "0px 20px 12px 20px"},
+                    _workspace_shell(
+                        secondary_elements,
+                        padding="0px 20px 16px 20px",
+                    )
+                ] if secondary_elements else [])
+            ),
         },
-        "body": {"elements": elements},
     }
 
 
@@ -1528,32 +2361,61 @@ def build_desktop_list_card(
     page = max(0, min(page, total_pages - 1))
     start = page * DESKTOP_LIST_PAGE_SIZE
 
+    heading_title = "Codex Desktop 已归档" if archived else "Codex Desktop"
+    heading_tag = "已归档" if archived else "任务列表"
+    elements.extend(_heading(
+        heading_title,
+        "{} · 第 {}/{} 页 · 共 {} 个".format(
+            "选择已归档任务" if archived else "选择最近任务",
+            page + 1,
+            total_pages,
+            total,
+        ),
+        heading_tag,
+    ))
+    elements.append(_highlight_grid(
+        "TASKS",
+        "{} 个".format(total),
+        "已归档任务" if archived else "最近 Desktop 任务",
+        "PAGE",
+        "{}/{}".format(page + 1, total_pages),
+        "选择任务后进入 Workspace",
+    ))
+
     for thread, thread_id in valid_threads[start:start + DESKTOP_LIST_PAGE_SIZE]:
-        title = _clean_text(thread.get("title"), 160) or "未命名任务"
+        title = _clean_text(thread.get("title"), 160) or "Codex Desktop 任务"
         cwd = _clean_text(thread.get("cwd"), 240) or ""
         project_name = _clean_text(thread.get("project_name"), 120)
         if not project_name and cwd:
             project_name = cwd.rstrip("/").rsplit("/", 1)[-1]
-        project_name = project_name or "未知项目"
         updated_at = _clean_text(thread.get("updated_at"), 80) or ""
         is_current = thread_id == current_thread_id
-        status_icon = _LIST_STATUS_ICONS.get(thread.get("status"), "⚪")
+        thread_status = thread.get("status")
+        if thread_status not in _STATUS_LABELS:
+            thread_status = "unknown"
+        status_label = _STATUS_LABELS[thread_status]
+        title_line = "**{}**".format(project_name or title)
+        status_line = status_label
+        if is_current:
+            status_line += " · 当前任务"
         details = [
-            f"{status_icon} **{project_name}**",
-            f"Session：**{title}**",
-            f"Session ID：`{thread_id}`",
+            "<font color='codex_muted'>{}</font>".format(status_line),
+            title_line,
         ]
+        if project_name:
+            details.append(f"Session：**{title}**")
+        details.append(f"Session ID：`{thread_id}`")
         if cwd:
             details.append(f"目录：`{cwd}`")
         if updated_at:
             details.append(f"<font color='grey'>更新：{updated_at}</font>")
         if archived:
             buttons = [
-                _button("恢复并进入", "primary", {
+                _theme_control("恢复并进入", {
                     "action": "desktop_attach",
                     "thread_id": thread_id,
-                }),
-                _button("移出归档", "default", {
+                }, primary=True),
+                _theme_control("移出归档", {
                     "action": "desktop_unarchive",
                     "thread_id": thread_id,
                     "page": page,
@@ -1561,99 +2423,80 @@ def build_desktop_list_card(
             ]
         else:
             action = "desktop_detach" if is_current else "desktop_attach"
-            label = "断开" if is_current else "进入"
-            button_type = "danger" if is_current else "primary"
-            buttons = [_button(label, button_type, {
+            label = "断开任务" if is_current else "进入任务"
+            buttons = [_theme_control(label, {
                 "action": action,
                 "thread_id": thread_id,
-            })]
+            }, primary=not is_current)]
+        elements.append(_surface([
+            _markdown("\n".join(details)),
+            _theme_control_row(buttons),
+        ], margin="8px 0px 0px 0px"))
+    if not valid_threads:
+        elements.append(_surface([
+            _markdown(
+                "**没有找到{}任务**\n<font color='grey'>{}</font>".format(
+                    "已归档" if archived else "本机 Codex Desktop",
+                    "归档任务会在这里显示。"
+                    if archived
+                    else "请确认 Codex Desktop 已启动并至少创建过一个任务。",
+                )
+            )
+        ]))
+    elif total_pages > 1:
+        page_action = "desktop_archived_list_page" if archived else "desktop_list_page"
+        if page == 0:
+            previous_button = _disabled_button("上一页")
+        else:
+            previous_button = _button("上一页", "default", {
+                "action": page_action,
+                "page": page - 1,
+            })
+        if page >= total_pages - 1:
+            next_button = _disabled_button("下一页")
+        else:
+            next_button = _button("下一页", "default", {
+                "action": page_action,
+                "page": page + 1,
+            })
         elements.append({
             "tag": "column_set",
-            "flex_mode": "none",
+            "flex_mode": "stretch",
+            "background_style": "default",
+            "horizontal_spacing": "8px",
+            "horizontal_align": "left",
             "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 4,
-                    "elements": [{"tag": "markdown", "content": "\n".join(details)}],
-                },
-                {
-                    "tag": "column",
-                    "width": "auto",
-                    "elements": buttons,
-                },
+                {"tag": "column", "width": "weighted", "weight": 1,
+                 "vertical_align": "top", "elements": [previous_button]},
+                {"tag": "column", "width": "weighted", "weight": 1,
+                 "vertical_align": "center", "elements": [
+                     _markdown(f"第 {page + 1}/{total_pages} 页 · 共 {total} 个")
+                 ]},
+                {"tag": "column", "width": "weighted", "weight": 1,
+                 "vertical_align": "top", "elements": [next_button]},
             ],
+            "margin": "12px 0px 0px 0px",
         })
-        elements.append({"tag": "hr"})
-    if elements and elements[-1].get("tag") == "hr":
-        elements.pop()
-    if not elements:
-        elements.append({"tag": "markdown", "content": "没有找到本机 Codex Desktop 会话。"})
-    elif total_pages > 1:
-        previous_button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "⬅ 上一页"},
-            "type": "default",
-        }
-        next_button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "下一页 ➡"},
-            "type": "default",
-        }
-        if page == 0:
-            previous_button["disabled"] = True
-        else:
-            previous_button["behaviors"] = [{
-                "type": "callback",
-                "value": {
-                    "action": (
-                        "desktop_archived_list_page" if archived else "desktop_list_page"
-                    ),
-                    "page": page - 1,
-                },
-            }]
-        if page >= total_pages - 1:
-            next_button["disabled"] = True
-        else:
-            next_button["behaviors"] = [{
-                "type": "callback",
-                "value": {
-                    "action": (
-                        "desktop_archived_list_page" if archived else "desktop_list_page"
-                    ),
-                    "page": page + 1,
-                },
-            }]
-        elements.extend([
-            {"tag": "hr"},
-            {
-                "tag": "column_set",
-                "flex_mode": "none",
-                "horizontal_spacing": "small",
-                "columns": [
-                    {"tag": "column", "width": "weighted", "weight": 1,
-                     "elements": [{"tag": "markdown", "content": " "}]},
-                    {"tag": "column", "width": "auto", "elements": [previous_button]},
-                    {"tag": "column", "width": "auto", "vertical_align": "center",
-                     "elements": [{"tag": "markdown", "content":
-                                   f"第 {page + 1}/{total_pages} 页 · 共 {total} 个"}]},
-                    {"tag": "column", "width": "auto", "elements": [next_button]},
-                    {"tag": "column", "width": "weighted", "weight": 1,
-                     "elements": [{"tag": "markdown", "content": " "}]},
-                ],
-            },
-        ])
+    elements.append(_footer("IM Agent Bridge · Codex Desktop {}".format(
+        "归档任务" if archived else "任务列表"
+    )))
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content":
-                      "Codex Desktop 已归档" if archived else "Codex Desktop 会话"},
-            "subtitle": {"tag": "plain_text", "content":
-                         f"选择任务 · 第 {page + 1}/{total_pages} 页 · 共 {total} 个"},
-            "template": "blue",
+        "config": _workspace_config(
+            "Codex Desktop：{}，共 {} 个任务".format(
+                "已归档任务" if archived else "最近任务",
+                total,
+            )
+        ),
+        "body": {
+            "direction": "vertical",
+            "horizontal_spacing": "0px",
+            "vertical_spacing": "0px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "padding": "0px 0px 0px 0px",
+            "elements": [_workspace_shell(elements)],
         },
-        "body": {"elements": elements},
     }
 
 
@@ -1662,42 +2505,55 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
 
     event = event if isinstance(event, Mapping) else {}
     thread_id = _identifier(event.get("thread_id")) or ""
-    title = _clean_text(event.get("title"), 160) or "未命名任务"
-    project_name = _clean_text(event.get("project_name"), 120) or "未知项目"
+    title = _clean_text(event.get("title"), 160) or "Codex Desktop 任务"
+    project_name = _clean_text(event.get("project_name"), 120)
     outcome = "failed" if event.get("outcome") == "failed" else "completed"
     failed = outcome == "failed"
     status_text = "执行失败" if failed else "执行完成"
-    icon = "🔴" if failed else "🟢"
-    elements: List[Dict[str, Any]] = [{
-        "tag": "markdown",
-        "content": (
-            f"{icon} **{project_name}**\n"
-            f"Session：**{title}**\n"
-            f"Session ID：`{thread_id}`"
-        ),
-    }]
+    elements: List[Dict[str, Any]] = _heading(
+        "Codex Desktop",
+        "任务完成提醒",
+        status_text,
+    )
+    elements.append(_highlight_grid(
+        "RESULT",
+        status_text,
+        "查看公开回复后决定是否继续。" if failed else "当前轮次已经完成。",
+        "NEXT",
+        "重新连接",
+        "进入原任务并继续发送指令。",
+    ))
+    details = []
+    if project_name:
+        details.append(f"**{project_name}**")
+    details.append(f"Session：**{title}**")
+    if thread_id:
+        details.append(f"Session ID：`{thread_id}`")
     completed_at = _clean_text(event.get("completed_at"), 80)
     if completed_at:
-        elements.append({
-            "tag": "markdown",
-            "content": f"<font color='grey'>时间：{completed_at}</font>",
-        })
+        details.append(f"<font color='grey'>时间：{completed_at}</font>")
+    surface_elements = [_markdown("\n".join(details))]
     if thread_id:
-        elements.append(_button_row([
-            _button("连接此 Session", "primary", {
+        surface_elements.append(_theme_control_row([
+            _theme_control("连接此 Session", {
                 "action": "desktop_attach",
                 "thread_id": thread_id,
-            }),
+            }, primary=True),
         ]))
+    elements.append(_surface(surface_elements))
+    elements.append(_footer("IM Agent Bridge · Codex Desktop 完成提醒"))
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True, "update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": f"Codex Desktop · {status_text}"},
-            "subtitle": {"tag": "plain_text", "content": "任务完成提醒"},
-            "template": "red" if failed else "green",
+        "config": _workspace_config("Codex Desktop：{}，{}".format(title, status_text)),
+        "body": {
+            "direction": "vertical",
+            "horizontal_spacing": "0px",
+            "vertical_spacing": "0px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "padding": "0px 0px 0px 0px",
+            "elements": [_workspace_shell(elements)],
         },
-        "body": {"elements": elements},
     }
 
 
@@ -1707,6 +2563,7 @@ __all__ = [
     "build_desktop_card",
     "build_desktop_completion_card",
     "build_desktop_list_card",
+    "extract_card_image_sources",
     "extract_public_events",
     "extract_public_turns",
     "normalize_conversation_state",

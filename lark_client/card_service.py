@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
 
@@ -13,7 +14,11 @@ import lark_oapi as lark
 
 logger = logging.getLogger('CardService')
 from lark_oapi.api.im.v1 import (
-    CreateMessageRequest, CreateMessageRequestBody,
+    CreateImageRequest,
+    CreateImageRequestBody,
+    GetMessageRequest,
+    CreateMessageRequest,
+    CreateMessageRequestBody,
 )
 from lark_oapi.api.cardkit.v1 import (
     CreateCardRequest, CreateCardRequestBody,
@@ -29,6 +34,24 @@ def _is_element_limit_error(msg: str) -> bool:
         return False
     lower = msg.lower()
     return "element exceeds" in lower or "超限" in lower
+
+
+MAX_CARD_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _is_supported_image(path: Path) -> bool:
+    """Accept common raster image signatures supported by Lark messages."""
+    try:
+        with path.open("rb") as source:
+            header = source.read(16)
+    except OSError:
+        return False
+    return bool(
+        header.startswith(b"\x89PNG\r\n\x1a\n")
+        or header.startswith(b"\xff\xd8\xff")
+        or header.startswith((b"GIF87a", b"GIF89a"))
+        or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
+    )
 
 
 class _ElementLimitResult:
@@ -112,6 +135,62 @@ class CardService:
         _track_stats('error', 'card_api', detail='create_card')
         return None
 
+    async def upload_image(self, image_path: Any) -> Optional[str]:
+        """Upload one verified local raster image for use by a card ``img`` node."""
+        if not self.client:
+            return None
+        try:
+            path = Path(image_path).expanduser().resolve(strict=True)
+            size = path.stat().st_size
+        except (OSError, RuntimeError, TypeError, ValueError):
+            logger.warning("卡片图片不可读取，已跳过")
+            return None
+        if not path.is_file() or size <= 0 or size > MAX_CARD_IMAGE_BYTES:
+            logger.warning("卡片图片为空、过大或不是普通文件，已跳过")
+            return None
+        if not _is_supported_image(path):
+            logger.warning("卡片图片格式不受支持，已跳过")
+            return None
+
+        import asyncio
+
+        for attempt in range(2):
+            try:
+                with path.open("rb") as image:
+                    request = CreateImageRequest.builder() \
+                        .request_body(
+                            CreateImageRequestBody.builder()
+                            .image_type("message")
+                            .image(image)
+                            .build()
+                        ) \
+                        .build()
+                    response = await asyncio.to_thread(
+                        self.client.im.v1.image.create, request
+                    )
+                if response.success():
+                    image_key = getattr(getattr(response, "data", None), "image_key", None)
+                    if isinstance(image_key, str) and image_key:
+                        return image_key
+                else:
+                    logger.warning(
+                        "上传卡片图片失败(attempt=%s): code=%s msg=%s",
+                        attempt + 1,
+                        response.code,
+                        response.msg,
+                    )
+            except Exception as error:
+                logger.warning(
+                    "上传卡片图片异常(attempt=%s): %s",
+                    attempt + 1,
+                    type(error).__name__,
+                )
+            if attempt == 0:
+                await asyncio.sleep(1)
+
+        _track_stats('error', 'card_api', detail='upload_image')
+        return None
+
     async def send_card(
         self,
         receive_id: str,
@@ -178,17 +257,23 @@ class CardService:
         *,
         message_uuid: Optional[str] = None,
     ) -> Optional[str]:
-        """发送独立私聊卡片，不替换聊天中的活跃流式卡片。"""
+        """发送独立私聊卡片，并登记其 message/card 映射供后续原地接管。"""
 
         card_id = await self.create_card(card_content)
         if not card_id:
             return None
-        return await self.send_card(
+        message_id = await self.send_card(
             user_id,
             card_id,
             receive_id_type="open_id",
             message_uuid=message_uuid,
         )
+        if message_id:
+            self._cards_by_message_id[message_id] = CardState(
+                card_id=card_id,
+                message_id=message_id,
+            )
+        return message_id
 
     async def update_card_by_message_id(
         self, message_id: str, card_content: Dict[str, Any]
@@ -348,6 +433,87 @@ class CardService:
     def set_active_card(self, chat_id: str, card_state: CardState):
         """设置聊天的活跃卡片"""
         self._active_cards[chat_id] = card_state
+        if card_state.message_id:
+            self._cards_by_message_id[card_state.message_id] = card_state
+
+    async def update_and_reuse_message_card(
+        self,
+        chat_id: str,
+        message_id: str,
+        card_content: Dict[str, Any],
+    ) -> bool:
+        """Update a sent card and promote it only after the update succeeds."""
+        state = self._cards_by_message_id.get(message_id)
+        if state is None:
+            state = await self._load_message_card_state(chat_id, message_id)
+        if state is None:
+            return False
+        state.sequence += 1
+        updated = await self.update_card(state.card_id, state.sequence, card_content)
+        if not updated:
+            return False
+        state.last_update = time.time()
+        self._active_cards[chat_id] = state
+        return True
+
+    async def _load_message_card_state(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> Optional[CardState]:
+        """Recover a CardKit card_id for a bot message after a process restart."""
+        if not self.client or not message_id:
+            return None
+        import asyncio
+
+        try:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = await asyncio.to_thread(
+                self.client.im.v1.message.get,
+                request,
+            )
+            if not response.success():
+                logger.warning(
+                    "反查卡片消息失败: code=%s msg=%s",
+                    response.code,
+                    response.msg,
+                )
+                return None
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            for item in items:
+                item_message_id = getattr(item, "message_id", None)
+                item_chat_id = getattr(item, "chat_id", None)
+                item_type = getattr(item, "msg_type", None)
+                if item_message_id and item_message_id != message_id:
+                    continue
+                if chat_id and item_chat_id and item_chat_id != chat_id:
+                    continue
+                if item_type and item_type != "interactive":
+                    continue
+                body = getattr(item, "body", None)
+                content = getattr(body, "content", None)
+                if not isinstance(content, str):
+                    continue
+                try:
+                    payload = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(payload, dict) or payload.get("type") != "card":
+                    continue
+                data = payload.get("data") if isinstance(payload, dict) else None
+                card_id = data.get("card_id") if isinstance(data, dict) else None
+                if not isinstance(card_id, str) or not card_id:
+                    continue
+                state = CardState(
+                    card_id=card_id,
+                    message_id=message_id,
+                    sequence=int(time.time() * 1000),
+                )
+                self._cards_by_message_id[message_id] = state
+                return state
+        except Exception as error:
+            logger.warning("反查卡片消息异常: %s", type(error).__name__)
+        return None
 
     def clear_active_card(self, chat_id: str):
         """清除聊天的活跃卡片"""

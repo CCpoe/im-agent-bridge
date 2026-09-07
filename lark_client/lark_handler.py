@@ -59,6 +59,19 @@ except Exception:
     def _track_stats(*args, **kwargs): pass
 
 
+_CUSTOM_MENU_COMMANDS = {
+    "任务列表": "/desktop",
+    "当前状态": "/desktop-status",
+    "归档任务": "/archived",
+    "停止任务": "/desktop-stop",
+    "断开任务": "/desktop-detach",
+    "文件列表": "/ls",
+    "目录树": "/tree",
+    "使用帮助": "/help",
+    "主菜单": "/menu",
+}
+
+
 class LarkHandler:
     """飞书消息处理器（群聊/私聊统一逻辑）"""
 
@@ -276,6 +289,7 @@ class LarkHandler:
         self._ensure_health_check_started()
         logger.info(f"收到消息: user={user_id[:8]}..., chat={chat_id[:8]}..., type={chat_type}, text={text[:50]}")
         text = text.strip()
+        text = _CUSTOM_MENU_COMMANDS.get(text, text)
 
         if text.startswith("/"):
             # /cl 前缀：去掉前缀，转发给 Claude
@@ -308,12 +322,22 @@ class LarkHandler:
                      chat_id=chat_id)
 
     async def forward_to_desktop(
-        self, user_id: str, chat_id: str, expected_thread_id: str, text: str
+        self,
+        user_id: str,
+        chat_id: str,
+        expected_thread_id: str,
+        text: str,
+        message_id: Optional[str] = None,
     ):
         """从带 thread id 的 Desktop 卡片发送消息，拒绝过期卡片。"""
         if self._desktop.binding_for(chat_id) != expected_thread_id:
             await card_service.send_text(chat_id, "该卡片已过期，请使用 /desktop 刷新")
             return
+        if message_id:
+            await self._desktop.refresh_card(
+                chat_id,
+                reuse_message_id=message_id,
+            )
         if not await self._desktop.send_message(chat_id, text):
             await card_service.send_text(chat_id, "发送到 Codex Desktop 失败，请刷新状态后重试")
 
@@ -502,6 +526,8 @@ class LarkHandler:
 
         had_cli_binding = chat_id in self._bridges or chat_id in self._chat_sessions
         attach_kwargs = {"owner_timeout": 0.75} if sys.platform == "darwin" else {}
+        if message_id:
+            attach_kwargs["reuse_message_id"] = message_id
         ok = await self._desktop.attach(
             chat_id, user_id, thread_id, **attach_kwargs
         )
@@ -525,7 +551,7 @@ class LarkHandler:
                             chat_id,
                             user_id,
                             clean_id,
-                            owner_timeout=0.75,
+                            **attach_kwargs,
                         )
                         if ok:
                             break
@@ -558,12 +584,19 @@ class LarkHandler:
         )
 
     async def handle_desktop_turn_page(
-        self, chat_id: str, expected_thread_id: str, target_turn_id: str
+        self,
+        chat_id: str,
+        expected_thread_id: str,
+        target_turn_id: str,
+        message_id: Optional[str] = None,
     ):
         """切换已连接 Desktop 卡片中显示的历史轮次。"""
 
         if not await self._desktop.select_turn(
-            chat_id, expected_thread_id, target_turn_id
+            chat_id,
+            expected_thread_id,
+            target_turn_id,
+            reuse_message_id=message_id,
         ):
             await card_service.send_text(
                 chat_id, "该轮次已不可用，请使用 /desktop-status 刷新"
@@ -1028,8 +1061,11 @@ class LarkHandler:
             cwd = self._get_pid_cwd(pid) if pid else None
             sessions_info.append({"name": s["name"], "cwd": cwd or ""})
 
+        desktop_cwd = self._desktop.cwd_for_chat(chat_id)
         bound_session = self._chat_sessions.get(chat_id)
-        if bound_session:
+        if desktop_cwd:
+            root = Path(desktop_cwd)
+        elif bound_session:
             pid = next((s.get("pid") for s in all_sessions if s["name"] == bound_session), None)
             session_cwd = self._get_pid_cwd(pid) if pid else None
             root = Path(session_cwd) if session_cwd else Path.home()

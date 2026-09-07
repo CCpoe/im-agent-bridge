@@ -70,6 +70,51 @@ thread 绑定的多个 chat 可以查看不同 turn。任何消息或 pending in
 当前 live turn 的 pending 审批/输入和停止按钮。rollout 基线在初始尾窗没有
 Query 时，会在有界字节窗口内反向找回最近用户轮的公开文本。
 
+**Codex Desktop 卡片视觉与交互：**
+
+- Desktop 实时卡、任务列表、归档列表和完成通知统一使用 Card JSON 2.0
+  的 GPT-style Codex Workspace：白色画布、淡紫 `#CBC5FF`、淡蓝 `#C6D6FF`、
+  Codex 深蓝 `#3941FF`。实时卡采用对话优先的单列结构：任务标题与紧凑状态行、
+  用户问题、全宽 Codex 回复、折叠历史进度、轮次导航、Composer、次级会话控制；
+  不再依赖传统原生 header，也不使用 STATUS / TURN 大面板。
+- 所有 Desktop 卡必须设置 `config.compact_width=false`、
+  `config.update_multi=true` 和 8–60 字的 `config.summary.content`；摘要只由
+  任务标题和公开状态生成，不得读取 Query、reasoning、工具输出或审批载荷。
+- `column_set` 的内容列一律 `width=weighted, weight=1`；只承担图标或 meta
+  的槽位才允许 `width=auto`。折叠面板统一使用右侧 `down_outlined` 箭头和
+  `icon_expanded_angle=-180`。
+- 实时卡正文必须保持单列，禁止把长 Assistant 回复与短 Task Context 强行等分；
+  审批与用户输入请求必须作为全宽中断区插在对话之前。历史轮标题行明确标识历史
+  轮次，且不能误写为实时同步。
+- Desktop 输入表单固定为 `form.name=desktop_input`、
+  `input.name=desktop_command__{thread_id}`、`button.name=desktop_send`，提交按钮
+  同时声明 `action_type=form_submit`、`form_action_type=submit` 和
+  `form_name=desktop_input`。菜单、停止和断开 callback 必须放在 form 外，避免
+  被 `form_value` 优先路由吞掉。
+- 视觉重构不得改变 callback payload：停止保留 `thread_id + turn_id`，审批和
+  用户输入保留 request/kind/question/decision 等字段。历史轮继续隐藏 live
+  审批、输入和停止按钮；文件修改审批在飞书端继续只允许拒绝。
+- 所有卡片上的 `desktop_attach` 都优先复用回调 `context.open_message_id` 对应的
+  CardKit 卡片：先原地更新成功，再把同一 `CardState` 提升为该聊天的活动卡；
+  映射缺失时通过飞书消息查询恢复 `card_id`，查询或更新失败时才降级新建卡片。
+  完成提醒发送后必须登记 `message_id -> CardState`，但在用户点击连接前不得替换
+  当前聊天的活动卡。
+- 历史卡片的轮次翻页和 Desktop 表单提交同样必须透传回调 `message_id`：先用新版
+  Card JSON 原地刷新并接管被点击的旧卡，再执行翻页或发送指令。这样旧版浅色 token
+  卡在深色客户端中经过一次交互后即可迁移，且后续状态不会更新到另一张卡。
+- 一轮内只把最新公开 Agent 消息放在全宽正文；更早的公开进度收进折叠面板。
+  reasoning、工具输出和未知 payload 永远不进入卡片。公开回复里的本地 Markdown
+  图片只在内存中保留来源，并且必须解析到当前任务工作目录内；发送前验证为
+  PNG/JPEG/GIF/WebP 且不超过 10 MiB，再经飞书图片 API 上传成 `img_key`；上传结果
+  按路径、mtime 和大小缓存，并发请求合并，失败短暂退避。
+  本地路径和远程图片 URL 不得进入卡片 JSON 或日志，上传失败时只保留可读 alt 文本。
+- 回复图片统一用 `img_combination` 缩略布局：单图也使用 `double` 槽位，双图使用
+  `double`，三图使用 `triple`，四图使用 `bisect`；全卡最多展示 4 个唯一图片来源，
+  避免长截图按正文全宽展开。图片 alt 已保留在正文中，点击缩略图查看原图。
+- Codex 主题必须为每个颜色 token 分别定义 light/dark 值。浅色保持白底与淡紫/淡蓝；
+  深色使用深靛画布与 surface、近白正文、浅灰次要文字和提亮的主按钮，禁止把浅色
+  token 原样复制到 `dark_mode`。
+
 **Server 端数据流（全量快照架构）：**
 ```
 PTY data → self._renderer.feed(data) → HistoryScreen(220×100, history=5000) 持久化实时更新
