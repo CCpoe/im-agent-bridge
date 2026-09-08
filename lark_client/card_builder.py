@@ -15,6 +15,8 @@ import pathlib as _pl
 import json as _json
 from typing import Dict, Any, List, Optional
 
+from lark_client.card_theme import soft_color_tokens
+
 _cb_logger = logging.getLogger('CardBuilder')
 
 # CLI 类型 → 显示名称映射（用于卡片标题中的"就绪"文案）
@@ -31,12 +33,67 @@ except Exception:
     _VERSION = ""
 
 
-def _build_header(title: str, template: str) -> dict:
-    """构建卡片 header，自动附加版本号副标题"""
-    h: dict = {"title": {"tag": "plain_text", "content": title}, "template": template}
+def _build_header(title: str, template: str, tone: Optional[str] = None) -> dict:
+    """正文中的柔和标题：原生 header 会强制白字，不能使用浅底深字。"""
+    if tone is None:
+        tone = {"green": "success", "orange": "waiting", "yellow": "waiting",
+                "red": "failure"}.get(template, "neutral")
+    title_elements = [{
+        "tag": "div", "text_size": "heading",
+        "text": {"tag": "plain_text", "content": title,
+                 "text_color": f"codex_status_{tone}_text"},
+    }]
     if _VERSION:
-        h["subtitle"] = {"tag": "plain_text", "content": _VERSION}
-    return h
+        title_elements.append({
+            "tag": "div", "text_size": "notation",
+            "text": {"tag": "plain_text", "content": _VERSION,
+                     "text_color": f"codex_status_{tone}_text"},
+        })
+    return {
+        "tag": "column_set",
+        "element_id": "cli_card_header",
+        "flex_mode": "none",
+        "columns": [{
+            "tag": "column", "width": "weighted", "weight": 1,
+            "background_style": f"codex_status_{tone}_bg",
+            "padding": "12px 12px 12px 12px",
+            "vertical_spacing": "4px",
+            "elements": title_elements,
+        }],
+    }
+
+
+def _card_config(summary: str, **options: Any) -> Dict[str, Any]:
+    """所有 CLI/辅助卡共享浅深色 token，同时保留各入口的原有配置。"""
+    return {
+        **options,
+        "compact_width": False,
+        "summary": {"content": summary[:60]},
+        "style": {"color": soft_color_tokens()},
+    }
+
+
+def _soft_primary_control(button: Dict[str, Any]) -> Dict[str, Any]:
+    """只替换视觉：原生按钮与表单/回调元数据均留在原按钮上。"""
+    control = {
+        **button,
+        "type": "text",
+        "width": button.get("width", "fill"),
+        "text": {**button["text"], "text_color": "codex_button_text"},
+    }
+    # column surface 没有伪交互；提交按钮仍是 form 内的 native button。
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [{
+            "tag": "column",
+            "width": "weighted",
+            "weight": 1,
+            "background_style": "codex_button",
+            "padding": "2px 4px 2px 4px",
+            "elements": [control],
+        }],
+    }
 
 # ANSI SGR 前景色码 → 飞书颜色
 # 飞书支持: blue, wathet, turquoise, green, yellow, orange, red, carmine, violet, purple, indigo, grey
@@ -236,14 +293,13 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
             {
                 "tag": "column",
                 "width": "auto",
-                "elements": [{
+                "elements": [_soft_primary_control({
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "🔗 重新连接"},
-                    "type": "primary",
                     "behaviors": [{"type": "callback", "value": {
                         "action": "stream_reconnect", "session": session_name or ""
                     }}]
-                }]
+                })]
             },
         ]
         return [{"tag": "column_set", "flex_mode": "none", "columns": cols}]
@@ -282,13 +338,12 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
             {
                 "tag": "column",
                 "width": "auto",
-                "elements": [{
+                "elements": [_soft_primary_control({
                     "tag": "button",
                     "name": "enter_submit",
                     "text": {"tag": "plain_text", "content": "Enter ↵"},
-                    "type": "primary",
                     "action_type": "form_submit",
-                }]
+                })]
             },
         ]
     else:
@@ -312,13 +367,12 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
             {
                 "tag": "column",
                 "width": "auto",
-                "elements": [{
+                "elements": [_soft_primary_control({
                     "tag": "button",
                     "name": "enter_submit",
                     "text": {"tag": "plain_text", "content": "Enter ↵"},
-                    "type": "primary",
                     "action_type": "form_submit",
-                }]
+                })]
             },
         ]
 
@@ -370,6 +424,9 @@ def _build_menu_button_row(session_name: Optional[str] = None, disconnected: boo
         "expanded": False,
         "header": {
             "title": {"tag": "plain_text", "content": "⌨️ 快捷键"},
+            "icon": {"tag": "standard_icon", "token": "down_outlined", "color": "grey"},
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
         },
         "elements": [row1, row2],
     }
@@ -406,7 +463,20 @@ def _build_buttons_v2(options: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     total = len(options)
     elements = [{"tag": "hr"}]
     for i, opt in enumerate(options):
-        btn_type = "primary" if i == 0 else "default"
+        button = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": f"{i+1}. {opt['label']}"},
+            "type": "default",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "action": "select_option",
+                    "value": opt["value"],
+                    "needs_input": opt.get("needs_input", False),
+                    "total": str(total),
+                },
+            }],
+        }
         elements.append({
             "tag": "column_set",
             "flex_mode": "none",
@@ -416,24 +486,7 @@ def _build_buttons_v2(options: List[Dict[str, str]]) -> List[Dict[str, Any]]:
                     "width": "weighted",
                     "weight": 1,
                     "horizontal_align": "left",
-                    "elements": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": f"{i+1}. {opt['label']}"},
-                            "type": btn_type,
-                            "behaviors": [
-                                {
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "select_option",
-                                        "value": opt["value"],
-                                        "needs_input": opt.get("needs_input", False),
-                                        "total": str(total),
-                                    }
-                                }
-                            ]
-                        }
-                    ]
+                    "elements": [_soft_primary_control(button) if i == 0 else button],
                 }
             ]
         })
@@ -571,7 +624,12 @@ def _render_plan_block(block_dict: dict) -> Optional[Dict[str, Any]]:
     return {
         "tag": "collapsible_panel",
         "expanded": True,
-        "header": {"title": {"tag": "plain_text", "content": f"📋 {title}"}},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"📋 {title}"},
+            "icon": {"tag": "standard_icon", "token": "down_outlined", "color": "grey"},
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
         "elements": [{"tag": "markdown", "content": content_md}],
     }
 
@@ -763,9 +821,14 @@ def build_stream_card(
 
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True, "enable_forward": True},
-        "header": _build_header(title, template),
-        "body": {"elements": elements},
+        "config": _card_config(f"CLI 会话输出 · {title}", wide_screen_mode=True, enable_forward=True),
+        "body": {"elements": [
+            _build_header(title, template, tone={
+                "orange": "running", "blue": "waiting", "red": "waiting",
+                "green": "success",
+            }.get(template, "neutral")),
+            *elements,
+        ]},
     }
 
 
@@ -829,7 +892,7 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                 btn_action = "list_detach"
             else:
                 btn_label = "进入会话"
-                btn_type = "primary"
+                btn_type = "default"
                 btn_action = "list_attach"
             has_group = bool(session_groups and name in session_groups)
 
@@ -856,6 +919,8 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                     [{"type": "callback", "value": {"action": "list_new_group", "session": name}}]
                 },
             ]
+            if not is_current:
+                right_buttons[0] = _soft_primary_control(right_buttons[0])
             if has_group:
                 right_buttons.append({
                     "tag": "button",
@@ -884,13 +949,13 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                     {
                         "tag": "column",
                         "width": "weighted",
-                        "weight": 3,
+                        "weight": 1,
                         "elements": [{"tag": "markdown", "content": header_text}]
                     },
                     {
                         "tag": "column",
                         "width": "weighted",
-                        "weight": 2,
+                        "weight": 1,
                         "elements": right_buttons
                     },
                 ]
@@ -955,9 +1020,9 @@ def build_status_card(connected: bool, session_name: Optional[str] = None) -> Di
 
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
-        "header": _build_header(title, template),
+        "config": _card_config(f"CLI 会话连接状态 · {title}", wide_screen_mode=True),
         "body": {"elements": [
+            _build_header(title, template),
             {"tag": "markdown", "content": content},
             {"tag": "hr"},
             _build_menu_button_only(),
@@ -1051,17 +1116,16 @@ def build_dir_card(target, entries: List[Dict], sessions: List[Dict], tree: bool
                 ]
             else:
                 action_btns = [
-                    {
+                    _soft_primary_control({
                         "tag": "button",
                         "text": {"tag": "plain_text", "content": "Claude群聊"},
-                        "type": "primary",
                         "behaviors": [{"type": "callback", "value": {
                             "action": "dir_new_group",
                             "path": full_path,
                             "session_name": auto_session,
                             "cli_type": "claude"
                         }}]
-                    },
+                    }),
                     {
                         "tag": "button",
                         "text": {"tag": "plain_text", "content": "Codex群聊"},
@@ -1081,7 +1145,7 @@ def build_dir_card(target, entries: List[Dict], sessions: List[Dict], tree: bool
                     {
                         "tag": "column",
                         "width": "weighted",
-                        "weight": 4,
+                        "weight": 1,
                         "elements": [{
                             "tag": "interactive_container",
                             "width": "fill",
@@ -1095,7 +1159,7 @@ def build_dir_card(target, entries: List[Dict], sessions: List[Dict], tree: bool
                     {
                         "tag": "column",
                         "width": "weighted",
-                        "weight": 2,
+                        "weight": 1,
                         "elements": action_btns
                     }
                 ]
@@ -1143,9 +1207,8 @@ def build_dir_card(target, entries: List[Dict], sessions: List[Dict], tree: bool
 
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
-        "header": _build_header(title, "blue"),
-        "body": {"elements": elements}
+        "config": _card_config(f"CLI 目录浏览 · {title}", wide_screen_mode=True),
+        "body": {"elements": [_build_header(title, "blue"), *elements]}
     }
 
 
@@ -1184,9 +1247,9 @@ def build_help_card() -> Dict[str, Any]:
 
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
-        "header": _build_header("📖 Remote Claude 帮助", "blue"),
+        "config": _card_config("Remote Claude 帮助 · 会话管理与快捷操作", wide_screen_mode=True),
         "body": {"elements": [
+            _build_header("📖 Remote Claude 帮助", "blue"),
             {"tag": "markdown", "content": help_content},
             {"tag": "hr"},
             _build_menu_button_only(),
@@ -1198,9 +1261,9 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
     """构建会话关闭通知卡片（服务端关闭时推送给用户）"""
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
-        "header": _build_header("🔴 会话已关闭", "red"),
+        "config": _card_config("CLI 会话已关闭 · 可查看并连接其他会话", wide_screen_mode=True),
         "body": {"elements": [
+            _build_header("🔴 会话已关闭", "red"),
             {"tag": "markdown", "content": f"会话 **{session_name}** 已关闭，连接已自动断开。\n\n如需继续，请重新启动会话或连接到其他会话。"},
             {"tag": "hr"},
             {
@@ -1210,12 +1273,11 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
                     {
                         "tag": "column",
                         "width": "auto",
-                        "elements": [{
+                        "elements": [_soft_primary_control({
                             "tag": "button",
                             "text": {"tag": "plain_text", "content": "📋 查看会话"},
-                            "type": "primary",
                             "behaviors": [{"type": "callback", "value": {"action": "menu_list"}}]
-                        }]
+                        })]
                     },
                     {
                         "tag": "column",
@@ -1248,14 +1310,15 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
 
     if desktop_available:
         elements.append({"tag": "hr"})
-        elements.append({
+        desktop_button = {
             "tag": "button",
             "text": {"tag": "plain_text", "content": (
                 "🖥️ Desktop 会话（已连接）" if desktop_connected else "🖥️ Desktop 会话"
             )},
-            "type": "primary" if desktop_connected else "default",
+            "type": "default",
             "behaviors": [{"type": "callback", "value": {"action": "desktop_list"}}],
-        })
+        }
+        elements.append(_soft_primary_control(desktop_button) if desktop_connected else desktop_button)
 
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown", "content": "**快捷操作**"})
@@ -1358,7 +1421,6 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
 
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
-        "header": _build_header("⚡ 快捷操作", "turquoise"),
-        "body": {"elements": elements}
+        "config": _card_config("Remote Claude 快捷操作 · 会话管理与通知设置", wide_screen_mode=True),
+        "body": {"elements": [_build_header("⚡ 快捷操作", "turquoise"), *elements]}
     }

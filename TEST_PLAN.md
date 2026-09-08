@@ -13,11 +13,18 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
   tests/test_desktop_lark_integration.py \
   tests/test_option_select.py \
   tests/test_card_service_images.py \
-  tests/test_desktop_subagents.py
+  tests/test_desktop_subagents.py \
+  tests/test_card_theme.py \
+  tests/test_card_time.py \
+  tests/test_card_builder_palette.py \
+  tests/test_stream_poller.py
 ```
 
 覆盖范围：
 
+- 完成/失败提醒及普通/归档列表的北京时间显示；UTC、显式正负偏移、跨日/跨年、
+  已为 UTC+8 时不重复转换、主机时区无关、毫秒省略及非法/无时区值安全省略；
+  展示格式化不得修改原始时间字段或通知去重、排序逻辑；
 - IPC 小端长度帧、initialize、request correlation、超时和重连；
 - owner discovery、follow、start/steer/interrupt、审批和用户输入；
 - `/desktop` 列表的项目映射、完整 Session ID 和每页 5 条分页；
@@ -36,7 +43,13 @@ UV_PYTHON=3.13 uv run --with pytest --with pytest-asyncio \
 - 长连接卡片按 turn 展示 Query/进度及历史翻页，翻页状态按 chat 隔离，历史轮隐藏 live pending/停止操作，成功发送后立即回到最新轮；
 - Desktop 实时卡、任务列表、归档列表和完成通知的 Card JSON 2.0 GPT-style
   Workspace 基础契约：`compact_width=false`、公开摘要、等比分栏、标准折叠箭头，
-  以及白色、`#CBC5FF`、`#C6D6FF`、`#3941FF` 四个最终主题色；
+  以及集中式低饱和色板：雾蓝灰操作色、灰蓝运行色、灰绿完成色、米灰等待色、
+  灰红失败色与中性状态色；状态徽标与主操作色必须分离，旧亮蓝不可回退；
+- 已确认色板的全部 light/dark 值、返回值修改隔离和文字对比度；成功/失败 RESULT
+  与固定操作色 NEXT 不串色，列表/归档统计保持中性，子任务状态不影响父徽标；
+- CLI 重新连接、Enter 表单、首选项、进入会话、Claude 群聊、查看会话和 Desktop
+  菜单主按钮的柔化覆盖；完整保留 callback/表单/confirm/disabled 等字段，不能
+  因颜色重构改变提交路径；正文软标题保留状态与版本，避免原生 header 强制白字；
 - 实时卡采用用户问题 → 全宽 Codex 回复 → 折叠历史 → 轮次导航 → Composer →
   次级会话控制的单列顺序；审批/输入中断区位于对话之前，历史轮不出现实时操作；
 - Desktop 输入表单保持 `desktop_input` / `desktop_command__{thread_id}` /

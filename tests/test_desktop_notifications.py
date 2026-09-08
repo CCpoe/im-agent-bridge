@@ -278,7 +278,7 @@ async def test_monitor_skips_history_then_notifies_each_new_completion(tmp_path)
     user_id, card, message_uuid = cards.calls[0]
     assert user_id == "user-1"
     rendered = json.dumps(card, ensure_ascii=False)
-    assert "<font color='codex_on_accent'>**执行完成**</font>" in rendered
+    assert "<font color='codex_status_success_text'>**执行完成**</font>" in rendered
     assert card["config"]["summary"]["content"]
     assert "NEXT" in rendered
     assert "重新连接" in rendered
@@ -292,7 +292,7 @@ async def test_monitor_skips_history_then_notifies_each_new_completion(tmp_path)
     }))
     assert await monitor.poll_once() == 1
     failed_card = json.dumps(cards.calls[-1][1], ensure_ascii=False)
-    assert "<font color='codex_on_accent'>**执行失败**</font>" in failed_card
+    assert "<font color='codex_status_failure_text'>**执行失败**</font>" in failed_card
     assert "执行失败" in failed_card
 
     restarted_cards = FakeCardService()
@@ -639,7 +639,7 @@ async def test_monitor_streams_completion_record_larger_than_sixteen_megabytes(t
     assert await monitor.poll_once() == 1
     assert len(cards.calls) == 1
     rendered = json.dumps(cards.calls[0][1], ensure_ascii=False)
-    assert "<font color='codex_on_accent'>**执行完成**</font>" in rendered
+    assert "<font color='codex_status_success_text'>**执行完成**</font>" in rendered
     assert cards.calls[0][1]["config"]["summary"]["content"]
 
 
