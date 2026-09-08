@@ -18,6 +18,9 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
+from .card_theme import soft_color_tokens, status_color_tokens, status_tone
+from .card_time import format_beijing_time
+
 
 JSON = Union[None, bool, int, float, str, List["JSON"], Dict[str, "JSON"]]
 
@@ -1586,58 +1589,7 @@ def _workspace_config(summary: str) -> Dict[str, Any]:
         "enable_forward_interaction": False,
         "streaming_mode": False,
         "summary": {"content": _clean_text(summary, 60) or "Codex Desktop 任务状态已更新"},
-        "style": {
-            "color": {
-                "codex_canvas": {
-                    "light_mode": "rgba(255,255,255,1)",
-                    "dark_mode": "rgba(23,23,43,1)",
-                },
-                "codex_body": {
-                    "light_mode": "rgba(247,247,255,1)",
-                    "dark_mode": "rgba(31,33,54,1)",
-                },
-                "codex_panel": {
-                    "light_mode": "rgba(255,255,255,1)",
-                    "dark_mode": "rgba(38,41,64,1)",
-                },
-                "codex_secondary": {
-                    "light_mode": "rgba(215,220,245,1)",
-                    "dark_mode": "rgba(65,70,100,1)",
-                },
-                "codex_ink": {
-                    "light_mode": "rgba(23,23,43,1)",
-                    "dark_mode": "rgba(245,246,255,1)",
-                },
-                "codex_muted": {
-                    "light_mode": "rgba(92,97,120,1)",
-                    "dark_mode": "rgba(181,185,207,1)",
-                },
-                "codex_accent": {
-                    "light_mode": "rgba(203,197,255,1)",
-                    "dark_mode": "rgba(57,52,95,1)",
-                },
-                "codex_accent_2": {
-                    "light_mode": "rgba(198,214,255,1)",
-                    "dark_mode": "rgba(45,68,107,1)",
-                },
-                "codex_button": {
-                    "light_mode": "rgba(57,65,255,1)",
-                    "dark_mode": "rgba(90,97,255,1)",
-                },
-                "codex_button_text": {
-                    "light_mode": "rgba(255,255,255,1)",
-                    "dark_mode": "rgba(255,255,255,1)",
-                },
-                "codex_button_secondary": {
-                    "light_mode": "rgba(247,247,255,1)",
-                    "dark_mode": "rgba(37,40,63,1)",
-                },
-                "codex_on_accent": {
-                    "light_mode": "rgba(23,23,43,1)",
-                    "dark_mode": "rgba(245,246,255,1)",
-                },
-            },
-        },
+        "style": {"color": soft_color_tokens()},
     }
 
 
@@ -1695,7 +1647,10 @@ def _heading(
     title: str,
     subtitle: str,
     tag_label: str,
+    *,
+    status: str = "unknown",
 ) -> List[Dict[str, Any]]:
+    status_background, status_text = status_color_tokens(status)
     return [
         _markdown(
             "<font color='codex_ink'>**{}**</font>".format(
@@ -1722,7 +1677,7 @@ def _heading(
                     "corner_radius": "999px",
                     "has_border": False,
                     "disabled": False,
-                    "background_style": "codex_button",
+                    "background_style": status_background,
                     "padding": "3px 8px 3px 8px",
                     "direction": "vertical",
                     "horizontal_spacing": "0px",
@@ -1730,7 +1685,7 @@ def _heading(
                     "horizontal_align": "center",
                     "vertical_align": "top",
                     "elements": [_markdown(
-                        "<font color='codex_button_text'>{}</font>".format(tag_label),
+                        "<font color='{}'>{}</font>".format(status_text, tag_label),
                         text_size="notation",
                         margin="0px 0px 0px 0px",
                     )],
@@ -1802,6 +1757,7 @@ def _message_surface(elements: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _status_grid(status: str, context: str, *, historical: bool = False) -> Dict[str, Any]:
+    status_background, status_text = status_color_tokens("unknown" if historical else status)
     if historical:
         title = "历史轮次"
         detail = "审批、输入和停止操作已隐藏。"
@@ -1818,7 +1774,7 @@ def _status_grid(status: str, context: str, *, historical: bool = False) -> Dict
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
-                "background_style": "codex_accent",
+                "background_style": status_background,
                 "padding": "18px 16px 18px 16px",
                 "direction": "vertical",
                 "horizontal_spacing": "0px",
@@ -1826,14 +1782,14 @@ def _status_grid(status: str, context: str, *, historical: bool = False) -> Dict
                 "horizontal_align": "left",
                 "vertical_align": "top",
                 "elements": [
-                    _markdown("<font color='codex_on_accent'>NOW</font>", text_size="notation"),
+                    _markdown("<font color='{}'>NOW</font>".format(status_text), text_size="notation"),
                     _markdown(
-                        "<font color='codex_on_accent'>**{}**</font>".format(title),
+                        "<font color='{}'>**{}**</font>".format(status_text, title),
                         text_size="heading-2",
                         margin="6px 0px 0px 0px",
                     ),
                     _markdown(
-                        "<font color='codex_on_accent'>{}</font>".format(detail),
+                        "<font color='{}'>{}</font>".format(status_text, detail),
                         text_size="notation",
                         margin="8px 0px 0px 0px",
                     ),
@@ -1882,15 +1838,23 @@ def _highlight_grid(
     right_detail: str,
     *,
     right_action: Optional[Mapping[str, Any]] = None,
+    left_status: str = "unknown",
 ) -> Dict[str, Any]:
+    left_background, left_text = status_color_tokens(left_status)
+    if status_tone(left_status) == "success":
+        left_background = "codex_accent"
+    right_background, right_text = (
+        ("codex_accent_2", "codex_button_text")
+        if right_action else status_color_tokens("unknown")
+    )
     right_surface = _surface([
-        _markdown("<font color='codex_on_accent'>{}</font>".format(right_label),
+        _markdown("<font color='{}'>{}</font>".format(right_text, right_label),
                   text_size="notation"),
-        _markdown("<font color='codex_on_accent'>**{}**</font>".format(right_title),
+        _markdown("<font color='{}'>**{}**</font>".format(right_text, right_title),
                   text_size="heading-2", margin="6px 0px 0px 0px"),
-        _markdown("<font color='codex_on_accent'>{}</font>".format(right_detail),
+        _markdown("<font color='{}'>{}</font>".format(right_text, right_detail),
                   text_size="notation", margin="8px 0px 0px 0px"),
-    ], background="codex_accent_2", margin="0px 0px 0px 0px")
+    ], background=right_background, margin="0px 0px 0px 0px")
     if right_action:
         # 整个 NEXT 区域承接连接操作，保留原来的 callback 协议。
         right_surface["behaviors"] = [{"type": "callback", "value": dict(right_action)}]
@@ -1910,13 +1874,13 @@ def _highlight_grid(
                 "weight": 1,
                 "vertical_align": "top",
                 "elements": [_surface([
-                    _markdown("<font color='codex_on_accent'>{}</font>".format(left_label),
+                    _markdown("<font color='{}'>{}</font>".format(left_text, left_label),
                               text_size="notation"),
-                    _markdown("<font color='codex_on_accent'>**{}**</font>".format(left_title),
+                    _markdown("<font color='{}'>**{}**</font>".format(left_text, left_title),
                               text_size="heading-2", margin="6px 0px 0px 0px"),
-                    _markdown("<font color='codex_on_accent'>{}</font>".format(left_detail),
+                    _markdown("<font color='{}'>{}</font>".format(left_text, left_detail),
                               text_size="notation", margin="8px 0px 0px 0px"),
-                ], background="codex_accent", margin="0px 0px 0px 0px")],
+                ], background=left_background, margin="0px 0px 0px 0px")],
             },
             {
                 "tag": "column",
@@ -2028,7 +1992,7 @@ def _theme_control(label: str, value: Dict[str, Any], *, primary: bool = False) 
         "height": "auto",
         "corner_radius": "12px",
         "has_border": True,
-        "border_color": "codex_secondary",
+        "border_color": "codex_button_border" if primary else "codex_secondary",
         "disabled": False,
         "background_style": "codex_button" if primary else "codex_button_secondary",
         "padding": "8px 12px 8px 12px",
@@ -2132,8 +2096,9 @@ def _button_icon(value: Mapping[str, Any]) -> Optional[str]:
 
 
 def _button(label: str, button_type: str, value: Dict[str, Any]) -> Dict[str, Any]:
+    if button_type == "primary":
+        return _theme_control(label, value, primary=True)
     visual_type = {
-        "primary": "primary_filled",
         "danger": "danger_filled",
     }.get(button_type, button_type)
     result: Dict[str, Any] = {
@@ -2295,6 +2260,7 @@ def build_desktop_card(
         title,
         subtitle,
         _STATUS_LABELS[display_status],
+        status=display_status,
     )
     turn_label = (
         "第 {}/{} 轮".format(selected_index + 1, len(public_turns))
@@ -2609,7 +2575,7 @@ def build_desktop_list_card(
         project_name = _clean_text(thread.get("project_name"), 120)
         if not project_name and cwd:
             project_name = cwd.rstrip("/").rsplit("/", 1)[-1]
-        updated_at = _clean_text(thread.get("updated_at"), 80) or ""
+        updated_at = format_beijing_time(thread.get("updated_at"))
         is_current = thread_id == current_thread_id
         thread_status = thread.get("status")
         if thread_status not in _STATUS_LABELS:
@@ -2736,6 +2702,7 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
         "Codex Desktop",
         "任务完成提醒",
         status_text,
+        status=outcome,
     )
     elements.append(_highlight_grid(
         "RESULT",
@@ -2748,6 +2715,7 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
             "action": "desktop_attach",
             "thread_id": thread_id,
         } if thread_id else None,
+        left_status=outcome,
     ))
     details = []
     if project_name:
@@ -2755,7 +2723,7 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
     details.append(f"Session：**{title}**")
     if thread_id:
         details.append(f"Session ID：`{thread_id}`")
-    completed_at = _clean_text(event.get("completed_at"), 80)
+    completed_at = format_beijing_time(event.get("completed_at"))
     if completed_at:
         details.append(f"<font color='grey'>时间：{completed_at}</font>")
     elements.append(_surface([_markdown("\n".join(details))]))

@@ -72,9 +72,16 @@ Query 时，会在有界字节窗口内反向找回最近用户轮的公开文�
 
 **Codex Desktop 卡片视觉与交互：**
 
+- 完成提醒的时间、任务列表与归档列表的更新时间统一显示为
+  `YYYY-MM-DD HH:MM:SS（北京时间）`，按明确的源时区转换为固定 UTC+8，省略毫秒。
+  仅展示层使用 `card_time.format_beijing_time`；后台 UTC 时间、排序、去重和持久化
+  不变。缺失、非法或未带时区的值不冒认北京时间，不展示该时间行。
 - Desktop 实时卡、任务列表、归档列表和完成通知统一使用 Card JSON 2.0
-  的 GPT-style Codex Workspace：白色画布、淡紫 `#CBC5FF`、淡蓝 `#C6D6FF`、
-  Codex 深蓝 `#3941FF`。实时卡采用对话优先的单列结构：任务标题与紧凑状态行、
+  的低饱和 Codex Workspace，颜色集中定义在 `lark_client/card_theme.py`：
+  浅色画布 `#FAFBFC`，主操作使用雾蓝灰 `#E5EDF3` 配深灰蓝 `#486175`。
+  运行、完成、等待、异常分别用灰蓝、灰绿、米灰、灰红；空闲、停止、未知、列表和
+  归档用中性灰。状态徽标不得再复用主按钮色，完成提醒 RESULT 按结果着色，NEXT
+  始终为操作色；任务列表统计不使用成功色。实时卡采用对话优先的单列结构：任务标题与紧凑状态行、
   用户问题、全宽 Codex 回复、折叠历史进度、轮次导航、Composer、次级会话控制；
   不再依赖传统原生 header，也不使用 STATUS / TURN 大面板。
 - 所有 Desktop 卡必须设置 `config.compact_width=false`、
@@ -128,9 +135,13 @@ Query 时，会在有界字节窗口内反向找回最近用户轮的公开文�
 - 回复图片统一用 `img_combination` 缩略布局：单图也使用 `double` 槽位，双图使用
   `double`，三图使用 `triple`，四图使用 `bisect`；全卡最多展示 4 个唯一图片来源，
   避免长截图按正文全宽展开。图片 alt 已保留在正文中，点击缩略图查看原图。
-- Codex 主题必须为每个颜色 token 分别定义 light/dark 值。浅色保持白底与淡紫/淡蓝；
-  深色使用深靛画布与 surface、近白正文、浅灰次要文字和提亮的主按钮，禁止把浅色
-  token 原样复制到 `dark_mode`。
+- Codex 主题必须为每个颜色 token 分别定义 light/dark 值。深色采用灰靛画布与
+  低饱和 surface，状态和操作文字仍须清晰；不得恢复旧亮蓝白字或把浅色 token
+  原样复制到 `dark_mode`。颜色只是辅助，状态文案必须保留。
+- CLI/菜单卡复用同一色板，原生主按钮保留原 button、callback、表单 name 与提交
+  字段，只改变按钮样式及外围色面；表单提交不可替换成普通回调容器。为避免原生
+  header 强制白字，标题改成正文首个 `cli_card_header` 软色面，保留标题、版本与
+  语义文字色，不更改 `_determine_header` 的状态判定契约。
 
 **Server 端数据流（全量快照架构）：**
 ```

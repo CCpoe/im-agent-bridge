@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from lark_client.card_theme import soft_color_tokens
 from lark_client.desktop_card import (
     MAX_PUBLIC_SUB_AGENTS,
     PatchApplyError,
@@ -55,6 +56,58 @@ def _buttons(card, label=None):
         if label is None or content == label:
             result.append(node)
     return result
+
+
+def _status_badge(card):
+    badges = [
+        node for node in _walk_card(card)
+        if node.get("tag") == "interactive_container"
+        and node.get("corner_radius") == "999px"
+    ]
+    assert len(badges) == 1
+    return badges[0]
+
+
+def _assert_status_badge(card, label, tone):
+    badge = _status_badge(card)
+    assert badge["background_style"] == f"codex_status_{tone}_bg"
+    assert badge["elements"][0]["content"] == (
+        f"<font color='codex_status_{tone}_text'>{label}</font>"
+    )
+    assert badge["behaviors"] == []
+    assert _callback_values(badge) == []
+
+
+def _callback_control(card, value):
+    controls = [
+        node for node in _walk_card(card)
+        if node.get("behaviors") == [{"type": "callback", "value": value}]
+    ]
+    assert len(controls) == 1
+    return controls[0]
+
+
+def _assert_soft_primary(control, label):
+    assert control["tag"] == "interactive_container"
+    assert control["background_style"] == "codex_button"
+    assert control["border_color"] == "codex_button_border"
+    assert control["elements"][0]["content"] == (
+        f"<font color='codex_button_text'>{label}</font>"
+    )
+
+
+def _highlight(card, label):
+    highlights = [
+        node for node in _walk_card(card)
+        if node.get("tag") == "interactive_container"
+        and any(
+            child.get("tag") == "markdown"
+            and child.get("content", "").endswith(f">{label}</font>")
+            for child in node.get("elements", [])
+        )
+    ]
+    assert len(highlights) == 1
+    return highlights[0]
 
 
 def _snapshot():
@@ -197,6 +250,25 @@ def test_normalized_sub_agent_lifecycle_status_and_extra_fields_are_sanitized(st
     rendered = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
     assert "SECRET_NORMALIZED" not in rendered
     assert {"failed": "review · 异常", "interrupted": "review · 已停止", "unknown": "review · 状态待同步"}[status] in rendered
+
+
+@pytest.mark.parametrize("child_status", ["running", "completed", "failed", "interrupted", "unknown"])
+def test_sub_agent_status_never_changes_parent_badge_or_stop_callback(child_status):
+    normalized = normalize_conversation_state(_snapshot(), retain_raw=False)
+    normalized["turns"][0]["sub_agents"] = [{
+        "thread_id": "child-1", "agent_path": "/root/review", "status": child_status,
+    }]
+    before = copy.deepcopy(normalized)
+    card = build_desktop_card(normalized)
+
+    _assert_status_badge(card, "运行中", "running")
+    assert normalized == before
+    assert normalized["status"] == "running"
+    assert normalized["pending"] is None
+    assert card["config"]["summary"]["content"].endswith("运行中")
+    assert _callback_values(card, "desktop_interrupt") == [{
+        "action": "desktop_interrupt", "thread_id": "thread-1", "turn_id": "turn-1",
+    }]
 
 
 @pytest.mark.parametrize("patch_only", [False, True])
@@ -534,6 +606,15 @@ def test_approval_request_sets_waiting_state_and_card_actions():
     assert all(action["action"] == "desktop_approval" for action in actions)
     assert all(action["thread_id"] == "thread-1" for action in actions)
     assert all(action["request_id"] == 77 for action in actions)
+    assert actions == [{
+        "action": "desktop_approval", "thread_id": "thread-1", "request_id": 77,
+        "kind": "command_execution", "decision": decision,
+    } for decision in ("accept", "decline")]
+    _assert_status_badge(card, "等待审批", "waiting")
+    _assert_soft_primary(_callback_control(card, actions[0]), "允许")
+    decline = _callback_control(card, actions[1])
+    assert decline["background_style"] == "codex_button_secondary"
+    assert decline["border_color"] == "codex_secondary"
 
 
 def test_permissions_request_keeps_grant_payload_internal_only():
@@ -570,6 +651,10 @@ def test_file_change_approval_only_allows_remote_decline():
     assert "飞书仅支持拒绝" in rendered
     assert '"decision": "accept"' not in rendered
     assert '"decision": "decline"' in rendered
+    assert _callback_values(card, "desktop_approval") == [{
+        "action": "desktop_approval", "thread_id": "thread-1", "request_id": "file-1",
+        "kind": "file_change", "decision": "decline",
+    }]
 
 
 def test_multiple_input_questions_fail_closed_to_desktop():
@@ -617,6 +702,11 @@ def test_user_input_request_only_exposes_question_and_options():
     assert "选择部署环境" in rendered
     assert "DO_NOT_SHOW_THIS_FIELD" not in rendered
     assert '"action": "desktop_input"' in rendered
+    assert _callback_values(card, "desktop_input") == [{
+        "action": "desktop_input", "thread_id": "thread-1", "request_id": "request-1",
+        "kind": "user_input", "question_id": "environment", "answer": answer,
+    } for answer in ("测试", "生产")]
+    _assert_status_badge(card, "等待输入", "waiting")
 
 
 def test_unknown_schema_fails_closed_without_recursive_text_scraping():
@@ -683,6 +773,10 @@ def test_desktop_card_v2_contract_for_all_states(status):
     assert _STATUS_LABEL_FOR_TEST[status] in rendered
     assert "PRIVATE_REASONING" not in rendered
     assert "PRIVATE_TOOL_OUTPUT" not in rendered
+    _assert_status_badge(card, _STATUS_LABEL_FOR_TEST[status], _STATUS_TONE_FOR_TEST[status])
+    menu = _callback_control(card, {"action": "menu_open"})
+    _assert_soft_primary(menu, "打开菜单")
+    assert menu["background_style"] != _status_badge(card)["background_style"]
 
 
 _STATUS_LABEL_FOR_TEST = {
@@ -694,6 +788,18 @@ _STATUS_LABEL_FOR_TEST = {
     "failed": "异常",
     "interrupted": "已停止",
     "unknown": "状态未知",
+}
+
+
+_STATUS_TONE_FOR_TEST = {
+    "idle": "neutral",
+    "running": "running",
+    "waiting_approval": "waiting",
+    "waiting_input": "waiting",
+    "completed": "success",
+    "failed": "failure",
+    "interrupted": "neutral",
+    "unknown": "neutral",
 }
 
 
@@ -841,18 +947,18 @@ def test_conversation_card_uses_single_column_copy_and_standard_collapsible_icon
 def test_all_desktop_builders_use_workspace_foundation_and_final_palette():
     cards = [
         build_desktop_card(normalize_conversation_state(_snapshot(), retain_raw=False)),
-        build_desktop_list_card([{
+        *(build_desktop_list_card([{
             "thread_id": "thread-1",
             "title": "Desktop 会话",
             "project_name": "测试项目",
             "status": "running",
-        }]),
-        build_desktop_completion_card({
+        }], archived=archived) for archived in (False, True)),
+        *(build_desktop_completion_card({
             "thread_id": "thread-1",
             "title": "Desktop 会话",
             "project_name": "测试项目",
-            "outcome": "completed",
-        }),
+            "outcome": outcome,
+        }) for outcome in ("completed", "failed")),
     ]
 
     for card in cards:
@@ -864,26 +970,25 @@ def test_all_desktop_builders_use_workspace_foundation_and_final_palette():
         assert card["body"]["padding"] == "0px 0px 0px 0px"
         assert card["body"]["elements"][0]["background_style"] == "codex_canvas"
         colors = card["config"]["style"]["color"]
-        assert colors["codex_canvas"]["light_mode"] == "rgba(255,255,255,1)"
-        assert colors["codex_accent"]["light_mode"] == "rgba(203,197,255,1)"
-        assert colors["codex_accent_2"]["light_mode"] == "rgba(198,214,255,1)"
-        assert colors["codex_button"]["light_mode"] == "rgba(57,65,255,1)"
-        assert {
-            name: token["dark_mode"] for name, token in colors.items()
-        } == {
-            "codex_canvas": "rgba(23,23,43,1)",
-            "codex_body": "rgba(31,33,54,1)",
-            "codex_panel": "rgba(38,41,64,1)",
-            "codex_secondary": "rgba(65,70,100,1)",
-            "codex_ink": "rgba(245,246,255,1)",
-            "codex_muted": "rgba(181,185,207,1)",
-            "codex_accent": "rgba(57,52,95,1)",
-            "codex_accent_2": "rgba(45,68,107,1)",
-            "codex_button": "rgba(90,97,255,1)",
-            "codex_button_text": "rgba(255,255,255,1)",
-            "codex_button_secondary": "rgba(37,40,63,1)",
-            "codex_on_accent": "rgba(245,246,255,1)",
+        assert colors == soft_color_tokens()
+        assert colors["codex_canvas"]["light_mode"] == "rgba(250,251,252,1)"
+        assert colors["codex_accent"]["light_mode"] == "rgba(237,243,239,1)"
+        assert colors["codex_accent_2"]["light_mode"] == "rgba(234,240,245,1)"
+        assert colors["codex_button"] == {
+            "light_mode": "rgba(229,237,243,1)",
+            "dark_mode": "rgba(59,75,88,1)",
         }
+        assert all(token["light_mode"] != token["dark_mode"] for token in colors.values())
+        rendered = json.dumps(card).lower()
+        for removed_color in (
+            "#3941ff", "#5a61ff", "rgba(57,65,255,1)", "rgba(90,97,255,1)",
+            "rgba(203,197,255,1)", "rgba(198,214,255,1)",
+        ):
+            assert removed_color not in rendered
+        assert not any(
+            node.get("tag") == "button" and node.get("type", "").startswith("primary")
+            for node in _walk_card(card)
+        )
 
 
 def test_pending_interrupt_precedes_conversation_and_history_is_read_only():
@@ -908,10 +1013,9 @@ def test_pending_interrupt_precedes_conversation_and_history_is_read_only():
     live = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
     assert live.index("命令执行审批") < live.index("正在检查项目结构")
 
-    historical = json.dumps(
-        build_desktop_card(normalized, selected_turn_id="turn-history"),
-        ensure_ascii=False,
-    )
+    historical_card = build_desktop_card(normalized, selected_turn_id="turn-history")
+    _assert_status_badge(historical_card, "已完成", "success")
+    historical = json.dumps(historical_card, ensure_ascii=False)
     assert "历史第 1/2 轮" in historical
     assert "实时同步" not in historical
     assert '"action": "desktop_approval"' not in historical
@@ -956,7 +1060,9 @@ def test_historical_turn_hides_live_pending_and_interrupt_controls():
     assert '"action": "desktop_interrupt"' not in historical
     assert '"action": "desktop_detach"' in historical
 
-    latest = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    latest_card = build_desktop_card(normalized)
+    _assert_status_badge(latest_card, "等待审批", "waiting")
+    latest = json.dumps(latest_card, ensure_ascii=False)
     assert "当前轮待审批" in latest
     assert '"action": "desktop_approval"' in latest
     assert '"action": "desktop_interrupt"' in latest
@@ -997,20 +1103,16 @@ def test_desktop_list_highlights_stay_passive_and_rows_keep_attach_actions(archi
         {"action": "desktop_attach", "thread_id": "thread-1"},
         {"action": "desktop_attach", "thread_id": "thread-2"},
     ]
+    _assert_status_badge(card, "已归档" if archived else "任务列表", "neutral")
+    tasks = _highlight(card, "TASKS")
+    assert tasks["background_style"] == "codex_status_neutral_bg"
+    for thread_id in ("thread-1", "thread-2"):
+        control = _callback_control(card, {"action": "desktop_attach", "thread_id": thread_id})
+        _assert_soft_primary(control, "恢复并进入" if archived else "进入任务")
     for label in ("TASKS", "PAGE"):
-        highlights = [
-            node for node in _walk_card(card)
-            if node.get("tag") == "interactive_container"
-            and any(
-                child.get("tag") == "markdown"
-                and child.get("content") == (
-                    f"<font color='codex_on_accent'>{label}</font>"
-                )
-                for child in node.get("elements", [])
-            )
-        ]
-        assert len(highlights) == 1
-        assert _callback_values(highlights[0]) == []
+        highlight = _highlight(card, label)
+        assert highlight["background_style"] == "codex_status_neutral_bg"
+        assert _callback_values(highlight) == []
 
 
 @pytest.mark.parametrize(("status", "label"), [
@@ -1136,7 +1238,14 @@ def test_desktop_completion_card_can_reconnect(outcome, label):
     assert card["config"]["compact_width"] is False
     assert card["config"]["summary"]["content"]
     assert label in rendered
-    assert f"<font color='codex_on_accent'>**{label}**</font>" in rendered
+    tone = "failure" if outcome == "failed" else "success"
+    _assert_status_badge(card, label, tone)
+    result = _highlight(card, "RESULT")
+    assert result["background_style"] == (
+        "codex_status_failure_bg" if outcome == "failed" else "codex_accent"
+    )
+    assert f"<font color='codex_status_{tone}_text'>**{label}**</font>" in rendered
+    assert _callback_values(result) == []
     assert "**项目名称**" in rendered
     assert "Session：**会话名称**" in rendered
     expected_action = {"action": "desktop_attach", "thread_id": "thread-1"}
@@ -1150,6 +1259,8 @@ def test_desktop_completion_card_can_reconnect(outcome, label):
     assert reconnect_control["tag"] == "interactive_container"
     assert reconnect_control["background_style"] == "codex_accent_2"
     reconnect_content = json.dumps(reconnect_control, ensure_ascii=False)
+    assert "<font color='codex_button_text'>NEXT</font>" in reconnect_content
+    assert f"codex_status_{tone}_text" not in reconnect_content
     assert "NEXT" in reconnect_content
     assert "重新连接" in reconnect_content
     assert "连接此 Session" not in rendered

@@ -398,6 +398,16 @@ class TestExtractButtons(unittest.TestCase):
 class TestBuildStreamCard(unittest.TestCase):
     """测试完整卡片构建"""
 
+    def _assert_soft_header(self, card, tone):
+        self.assertNotIn("header", card)
+        header = card["body"]["elements"][0]
+        self.assertEqual(header["element_id"], "cli_card_header")
+        column = header["columns"][0]
+        self.assertEqual(column["background_style"], f"codex_status_{tone}_bg")
+        title = column["elements"][0]["text"]
+        self.assertEqual(title["text_color"], f"codex_status_{tone}_text")
+        return title
+
     def test_basic_output(self):
         blocks = [
             {"_type": "UserInput", "text": "你好"},
@@ -405,7 +415,7 @@ class TestBuildStreamCard(unittest.TestCase):
         ]
         card = build_stream_card(blocks)
         self.assertEqual(card["schema"], "2.0")
-        self.assertEqual(card["header"]["template"], "green")
+        self._assert_soft_header(card, "success")
         elements = card["body"]["elements"]
         # 至少有 2 个 markdown（blocks）+ hr + menu
         md_elements = [e for e in elements if e.get("tag") == "markdown"]
@@ -414,12 +424,13 @@ class TestBuildStreamCard(unittest.TestCase):
     def test_frozen_card(self):
         blocks = [{"_type": "OutputBlock", "content": "历史内容", "indicator": "●"}]
         card = build_stream_card(blocks, is_frozen=True)
-        self.assertEqual(card["header"]["template"], "grey")
-        self.assertIn("会话记录", card["header"]["title"]["content"])
+        title = self._assert_soft_header(card, "neutral")
+        self.assertIn("会话记录", title["content"])
         # 冻结卡片无状态区和按钮区
         elements = card["body"]["elements"]
         # 菜单行现在在 form 里，顶层应无裸 column_set
-        col_sets = [e for e in elements if e.get("tag") == "column_set"]
+        col_sets = [e for e in elements if e.get("tag") == "column_set"
+                    and e.get("element_id") != "cli_card_header"]
         self.assertEqual(len(col_sets), 0)  # 菜单已移入 form，无裸 column_set
         # 应有 form 元素（菜单 + 输入框）
         forms = [e for e in elements if e.get("tag") == "form"]
@@ -429,7 +440,7 @@ class TestBuildStreamCard(unittest.TestCase):
         blocks = [{"_type": "OutputBlock", "content": "text", "indicator": "●", "is_streaming": True}]
         status = {"action": "Reading...", "elapsed": "5s", "tokens": "↓ 100"}
         card = build_stream_card(blocks, status_line=status)
-        self.assertEqual(card["header"]["template"], "orange")
+        self._assert_soft_header(card, "running")
         elements = card["body"]["elements"]
         # 应有 column_set grey 背景状态区
         grey_sets = [e for e in elements if e.get("tag") == "column_set" and e.get("background_style") == "grey"]
@@ -461,10 +472,11 @@ class TestBuildStreamCard(unittest.TestCase):
             ]},
         ]
         card = build_stream_card(blocks)
-        self.assertEqual(card["header"]["template"], "blue")
+        self._assert_soft_header(card, "waiting")
         elements = card["body"]["elements"]
         # 应有按钮行（column_set，菜单已移入 form）
-        col_sets = [e for e in elements if e.get("tag") == "column_set"]
+        col_sets = [e for e in elements if e.get("tag") == "column_set"
+                    and e.get("element_id") != "cli_card_header"]
         self.assertGreaterEqual(len(col_sets), 1)  # 至少 1 按钮行（菜单在 form 中）
 
     def test_with_permission_buttons(self):
@@ -476,7 +488,7 @@ class TestBuildStreamCard(unittest.TestCase):
             ]},
         ]
         card = build_stream_card(blocks)
-        self.assertEqual(card["header"]["template"], "red")
+        self._assert_soft_header(card, "waiting")
 
     def test_with_option_block_param(self):
         """option_block 参数：选项交互"""
@@ -490,9 +502,10 @@ class TestBuildStreamCard(unittest.TestCase):
             ],
         }
         card = build_stream_card(blocks, option_block=ob)
-        self.assertEqual(card["header"]["template"], "blue")
+        self._assert_soft_header(card, "waiting")
         elements = card["body"]["elements"]
-        col_sets = [e for e in elements if e.get("tag") == "column_set"]
+        col_sets = [e for e in elements if e.get("tag") == "column_set"
+                    and e.get("element_id") != "cli_card_header"]
         self.assertGreaterEqual(len(col_sets), 2)  # 按钮行 + 菜单行
 
     def test_with_permission_option_block_param(self):
@@ -509,7 +522,7 @@ class TestBuildStreamCard(unittest.TestCase):
             ],
         }
         card = build_stream_card(blocks, option_block=ob)
-        self.assertEqual(card["header"]["template"], "red")
+        self._assert_soft_header(card, "waiting")
 
     def test_empty_blocks(self):
         card = build_stream_card([])
@@ -548,16 +561,28 @@ class TestBuildStreamCard(unittest.TestCase):
         self.assertTrue(status_found)
 
         # 第三层：按钮区（column_set with select_option）
+        def _walk_nodes(value):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from _walk_nodes(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from _walk_nodes(child)
+
         button_sets = []
         for e in elements:
             if e.get("tag") == "column_set":
-                cols = e.get("columns", [])
-                for col in cols:
-                    for el in col.get("elements", []):
-                        behaviors = el.get("behaviors", [])
-                        for b in behaviors:
-                            if b.get("value", {}).get("action") == "select_option":
-                                button_sets.append(e)
+                for node in _walk_nodes(e):
+                    if node.get("tag") != "button":
+                        continue
+                    for behavior in node.get("behaviors", []):
+                        if behavior.get("value", {}).get("action") == "select_option":
+                            self.assertEqual(behavior["value"], {
+                                "action": "select_option", "value": "1",
+                                "needs_input": False, "total": "1",
+                            })
+                            button_sets.append(e)
         self.assertGreaterEqual(len(button_sets), 1)
 
         # 第四层：菜单按钮（现在在 form > column_set 内）
