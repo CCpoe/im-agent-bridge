@@ -78,12 +78,23 @@ Query 时，会在有界字节窗口内反向找回最近用户轮的公开文�
   不变。缺失、非法或未带时区的值不冒认北京时间，不展示该时间行。
 - Desktop 实时卡、任务列表、归档列表和完成通知统一使用 Card JSON 2.0
   的低饱和 Codex Workspace，颜色集中定义在 `lark_client/card_theme.py`：
-  浅色画布 `#FAFBFC`，主操作使用雾蓝灰 `#E5EDF3` 配深灰蓝 `#486175`。
+  浅色画布使用用户选定的 B 冷雾灰 `#F1F3F5`，主操作保持雾蓝灰 `#E5EDF3` 配深灰蓝 `#486175`。
   运行、完成、等待、异常分别用灰蓝、灰绿、米灰、灰红；空闲、停止、未知、列表和
   归档用中性灰。状态徽标不得再复用主按钮色，完成提醒 RESULT 按结果着色，NEXT
   始终为操作色；任务列表统计不使用成功色。实时卡采用对话优先的单列结构：任务标题与紧凑状态行、
   用户问题、全宽 Codex 回复、折叠历史进度、轮次导航、Composer、次级会话控制；
   不再依赖传统原生 header，也不使用 STATUS / TURN 大面板。
+- Desktop 外壳不再自绘边框与圆角：`_workspace_shell` 使用 `has_border=false` 和
+  `corner_radius=0px`，仅由飞书消息气泡提供外层轮廓，避免四角双线。内部内容盒和
+  按钮仍保留各自边界。浅色用 `codex_paper_edge` 冷灰底衬 `#E1E5E9` 模拟淡阴影：
+  左右各 2px 的无边框、无圆角、无交互侧衬连续包住正文、分隔区和 Composer 纸面，
+  最下沿用独立兄弟 `column_set/column` 的 3px padding 衔接。不得设置原生不存在的
+  shadow，也不使用低于官方最小值的容器 height；深色底衬与画布同色。
+  分隔线的原生分栏背景默认带小圆角，必须衬平直同色纸面，避免侧边出现弧形缺口。
+- 原生输入 form 继续位于 body 顶层，原有 name/submit/callback 均不变；内部 Composer
+  内容使用无边框画布承载背景和原 padding/spacing，侧衬放在 form 内部，不能把 form
+  套进视觉外壳。容器最多嵌套五层；按官方容器组件计数，不把 `column_set` 的内部
+  `column` 槽位重复计为容器层。
 - 所有 Desktop 卡必须设置 `config.compact_width=false`、
   `config.update_multi=true` 和 8–60 字的 `config.summary.content`；摘要只由
   任务标题和公开状态生成，不得读取 Query、reasoning、工具输出或审批载荷。

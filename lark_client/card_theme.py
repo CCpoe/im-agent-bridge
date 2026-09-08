@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 
 
-# 与用户确认的 soft-palette-card.json 一致；每个 token 独立定义浅/深色。
+# 状态/操作色保持已确认色板，浅色纸面采用用户选定的 B 冷雾灰；深色独立定义。
 _PALETTE = {
-    "codex_canvas": ("FAFBFC", "262B31"),
+    "codex_canvas": ("F1F3F5", "262B31"),
+    "codex_paper_edge": ("E1E5E9", "262B31"),
     "codex_body": ("FFFFFF", "2C3239"),
     "codex_panel": ("FFFFFF", "2C3239"),
     "codex_secondary": ("DDE4EA", "454F59"),

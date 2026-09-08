@@ -1969,9 +1969,9 @@ def _workspace_shell(
         "behaviors": [],
         "width": "fill",
         "height": "auto",
-        "corner_radius": "12px",
-        "has_border": True,
-        "border_color": "codex_secondary",
+        # 外部圆角与边框交给飞书消息气泡，避免两层轮廓在四角重叠。
+        "corner_radius": "0px",
+        "has_border": False,
         "disabled": False,
         "background_style": "codex_canvas",
         "padding": padding,
@@ -1982,6 +1982,66 @@ def _workspace_shell(
         "vertical_align": "top",
         "elements": list(elements),
     }
+
+
+def _paper_sides(content: Dict[str, Any]) -> Dict[str, Any]:
+    """用两侧各 2px 的非交互底衬模拟淡阴影，原生 form 必须留在外层。"""
+    return {
+        "tag": "interactive_container",
+        "behaviors": [],
+        "width": "fill",
+        "height": "auto",
+        "corner_radius": "0px",
+        "has_border": False,
+        "background_style": "codex_paper_edge",
+        "padding": "0px 2px 0px 2px",
+        "direction": "vertical",
+        "horizontal_spacing": "0px",
+        "vertical_spacing": "0px",
+        "horizontal_align": "left",
+        "vertical_align": "top",
+        "elements": [content],
+    }
+
+
+def _paper_edge() -> Dict[str, Any]:
+    """用合法列内边距呈现轻薄下沿；不是 CSS 模糊阴影，也不增加正文嵌套。"""
+    return {
+        "tag": "column_set",
+        "element_id": "codex_paper_edge",
+        "flex_mode": "none",
+        "background_style": "default",
+        "horizontal_spacing": "0px",
+        "margin": "0px 0px 0px 0px",
+        "columns": [{
+            "tag": "column",
+            "width": "weighted",
+            "weight": 1,
+            "background_style": "codex_paper_edge",
+            "padding": "0px 0px 3px 0px",
+            "vertical_spacing": "0px",
+            "elements": [],
+        }],
+    }
+
+
+def _workspace_divider(*, bottom_spacing: int = 0) -> Dict[str, Any]:
+    """让分隔线留白也使用纸面色，不在顶层 form 两侧留下白色横带。"""
+    divider = {
+        "tag": "column_set",
+        "background_style": "codex_canvas",
+        "flex_mode": "none",
+        "horizontal_spacing": "0px",
+        "columns": [{
+            "tag": "column", "width": "weighted", "weight": 1,
+            "background_style": "codex_canvas",
+            "padding": f"0px 20px {bottom_spacing}px 20px",
+            "vertical_spacing": "0px",
+            "elements": [{"tag": "hr", "margin": "0px 0px 0px 0px"}],
+        }],
+    }
+    # 分栏背景原生带小圆角；用平直同色纸面补齐，避免左右底衬在这里出现弧形缺口。
+    return _workspace_shell([divider], padding="0px 0px 0px 0px")
 
 
 def _theme_control(label: str, value: Dict[str, Any], *, primary: bool = False) -> Dict[str, Any]:
@@ -2160,7 +2220,7 @@ def _desktop_input_form(thread_id: str, *, historical: bool) -> Dict[str, Any]:
         if historical
         else "**{}**".format(heading)
     )
-    return {
+    form = {
         "tag": "form",
         "name": "desktop_input",
         "direction": "vertical",
@@ -2214,6 +2274,13 @@ def _desktop_input_form(thread_id: str, *, historical: bool) -> Dict[str, Any]:
             },
         ],
     }
+    # Form 不支持背景色且必须保持顶层；只给内部 Composer 内容铺纸面。
+    canvas = _workspace_shell(form["elements"], padding=form["padding"])
+    canvas["horizontal_spacing"] = form["horizontal_spacing"]
+    canvas["vertical_spacing"] = form["vertical_spacing"]
+    form["elements"] = [_paper_sides(canvas)]
+    form["padding"] = "0px 0px 0px 0px"
+    return form
 
 
 def build_desktop_card(
@@ -2504,18 +2571,19 @@ def build_desktop_card(
             "vertical_align": "top",
             "padding": "0px 0px 0px 0px",
             "elements": (
-                [_workspace_shell(elements)]
+                [_paper_sides(_workspace_shell(elements))]
                 + ([
-                    {"tag": "hr", "margin": "0px 20px 0px 20px"},
+                    _paper_sides(_workspace_divider()),
                     input_form,
                 ] if input_form else [])
                 + ([
-                    {"tag": "hr", "margin": "0px 20px 12px 20px"},
-                    _workspace_shell(
+                    _paper_sides(_workspace_divider(bottom_spacing=12)),
+                    _paper_sides(_workspace_shell(
                         secondary_elements,
                         padding="0px 20px 16px 20px",
-                    )
+                    ))
                 ] if secondary_elements else [])
+                + [_paper_edge()]
             ),
         },
     }
@@ -2682,7 +2750,7 @@ def build_desktop_list_card(
             "horizontal_align": "left",
             "vertical_align": "top",
             "padding": "0px 0px 0px 0px",
-            "elements": [_workspace_shell(elements)],
+            "elements": [_paper_sides(_workspace_shell(elements)), _paper_edge()],
         },
     }
 
@@ -2738,7 +2806,7 @@ def build_desktop_completion_card(event: Any) -> Dict[str, Any]:
             "horizontal_align": "left",
             "vertical_align": "top",
             "padding": "0px 0px 0px 0px",
-            "elements": [_workspace_shell(elements)],
+            "elements": [_paper_sides(_workspace_shell(elements)), _paper_edge()],
         },
     }
 

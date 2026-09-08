@@ -31,6 +31,86 @@ def _walk_card(value):
             yield from _walk_card(child)
 
 
+def _container_depth(value):
+    # 官方分栏示例包含三组 column_set > column；column 是分栏的内部槽位，
+    # 不重复计为一层容器。否则该官方示例本身就会被误算为超过五层。
+    # 官方依据：card-json-v2-components/containers/column-set 文档的完整示例。
+    if isinstance(value, dict):
+        is_container = value.get("tag") in {
+            "interactive_container", "column_set", "form", "collapsible_panel",
+        }
+        return int(is_container) + max(
+            (_container_depth(child) for child in value.values()), default=0,
+        )
+    if isinstance(value, list):
+        return max((_container_depth(child) for child in value), default=0)
+    return 0
+
+
+def _assert_paper_sides(card):
+    expected_sides = []
+    for module in card["body"]["elements"][:-1]:
+        if module.get("tag") == "form":
+            assert len(module["elements"]) == 1
+            side = module["elements"][0]
+        else:
+            side = module
+        expected_sides.append(side)
+        assert side["tag"] == "interactive_container"
+        assert side["background_style"] == "codex_paper_edge"
+        assert side["width"] == "fill"
+        assert side["height"] == "auto"
+        assert side["padding"] == "0px 2px 0px 2px"
+        assert side["horizontal_spacing"] == "0px"
+        assert side["vertical_spacing"] == "0px"
+        assert side["has_border"] is False
+        assert side["corner_radius"] == "0px"
+        assert side["behaviors"] == []
+        assert side.get("disabled") is not True
+        assert not {"action", "border_color", "hover_tips", "confirm"}.intersection(side)
+        assert len(side["elements"]) == 1
+        paper = side["elements"][0]
+        assert paper["tag"] in {"interactive_container", "column_set"}
+        assert paper["background_style"] == "codex_canvas"
+        assert not any(node.get("tag") == "form" for node in _walk_card(side))
+    actual_sides = [
+        node for node in _walk_card(card)
+        if node.get("tag") == "interactive_container"
+        and node.get("background_style") == "codex_paper_edge"
+    ]
+    # 只允许纸面/分隔线外侧的一层底衬，不在内部内容或 form 外继续叠壳。
+    assert {id(node) for node in actual_sides} == {id(node) for node in expected_sides}
+
+
+def _assert_native_paper_edge(card):
+    body = card["body"]["elements"]
+    edges = [node for node in _walk_card(card) if node.get("element_id") == "codex_paper_edge"]
+    assert len(edges) == 1
+    edge = edges[0]
+    assert body[-1] is edge
+    assert edge["tag"] == "column_set"
+    assert len(edge["columns"]) == 1
+    column = edge["columns"][0]
+    assert column["tag"] == "column"
+    assert column["width"] == "weighted"
+    assert column["weight"] == 1
+    assert column["background_style"] == "codex_paper_edge"
+    assert column["padding"] == "0px 0px 3px 0px"
+    assert column["elements"] == []
+    for node in _walk_card(edge):
+        assert not {"action", "behaviors", "height", "hover_tips", "confirm"}.intersection(node)
+        assert node.get("tag") != "interactive_container"
+    # 边沿是独立兄弟节点，不套在正文或表单外面，也不突破官方五层容器限制。
+    assert _container_depth(edge) == 1
+    assert _container_depth(card) == _container_depth(body[:-1])
+    assert _container_depth(card) <= 5
+    _assert_paper_sides(card)
+    for node in _walk_card(card):
+        assert not {"shadow", "box_shadow", "box-shadow", "filter", "class", "css"}.intersection(node)
+        if "tag" in node:
+            assert "style" not in node
+
+
 def _callback_values(card, action=None):
     values = []
     for node in _walk_card(card):
@@ -363,7 +443,7 @@ def test_canonical_sub_agent_history_and_live_turns_remain_isolated():
     assert changed["turns"][0]["sub_agents"][0]["status"] == "unknown"
     assert changed["turns"][1]["sub_agents"][0]["status"] == "running"
     assert changed["status"] == "running"
-    shell = build_desktop_card(changed)["body"]["elements"][0]["elements"]
+    shell = build_desktop_card(changed)["body"]["elements"][0]["elements"][0]["elements"]
     panel_index = next(index for index, node in enumerate(shell) if node.get("tag") == "collapsible_panel")
     navigation_index = next(index for index, node in enumerate(shell) if _callback_values(node, "desktop_turn_page"))
     assert panel_index < navigation_index
@@ -773,6 +853,7 @@ def test_desktop_card_v2_contract_for_all_states(status):
     assert _STATUS_LABEL_FOR_TEST[status] in rendered
     assert "PRIVATE_REASONING" not in rendered
     assert "PRIVATE_TOOL_OUTPUT" not in rendered
+    _assert_native_paper_edge(card)
     _assert_status_badge(card, _STATUS_LABEL_FOR_TEST[status], _STATUS_TONE_FOR_TEST[status])
     menu = _callback_control(card, {"action": "menu_open"})
     _assert_soft_primary(menu, "打开菜单")
@@ -805,21 +886,60 @@ _STATUS_TONE_FOR_TEST = {
 
 def test_desktop_form_preserves_dispatch_contract_and_controls_stay_outside():
     card = build_desktop_card(normalize_conversation_state(_snapshot(), retain_raw=False))
-    assert card["body"]["elements"][0]["tag"] == "interactive_container"
-    assert card["body"]["elements"][0]["background_style"] == "codex_canvas"
-    assert card["body"]["elements"][0]["corner_radius"] == "12px"
-    assert card["body"]["elements"][0]["border_color"] == "codex_secondary"
+    paper = card["body"]["elements"][0]["elements"][0]
+    assert paper["tag"] == "interactive_container"
+    assert paper["background_style"] == "codex_canvas"
+    assert paper["corner_radius"] == "0px"
+    assert paper["has_border"] is False
+    assert "border_color" not in paper
     assert [element["tag"] for element in card["body"]["elements"]] == [
         "interactive_container",
-        "hr",
-        "form",
-        "hr",
         "interactive_container",
+        "form",
+        "interactive_container",
+        "interactive_container",
+        "column_set",
     ]
     forms = [node for node in _walk_card(card) if node.get("tag") == "form"]
     assert len(forms) == 1
     form = forms[0]
     assert form["name"] == "desktop_input"
+    assert form is card["body"]["elements"][2]
+    for index, bottom_spacing in ((1, 0), (3, 12)):
+        divider_canvas = card["body"]["elements"][index]["elements"][0]
+        assert divider_canvas["tag"] == "interactive_container"
+        assert divider_canvas["background_style"] == "codex_canvas"
+        assert divider_canvas["padding"] == "0px 0px 0px 0px"
+        assert divider_canvas["has_border"] is False
+        assert divider_canvas["corner_radius"] == "0px"
+        assert "border_color" not in divider_canvas
+        assert divider_canvas["behaviors"] == []
+        assert len(divider_canvas["elements"]) == 1
+        divider = divider_canvas["elements"][0]
+        assert divider["tag"] == "column_set"
+        assert divider["background_style"] == "codex_canvas"
+        assert divider["horizontal_spacing"] == "0px"
+        assert divider["flex_mode"] == "none"
+        assert len(divider["columns"]) == 1
+        assert divider["columns"][0]["background_style"] == "codex_canvas"
+        assert divider["columns"][0]["padding"] == f"0px 20px {bottom_spacing}px 20px"
+        assert divider["columns"][0]["vertical_spacing"] == "0px"
+        assert divider["columns"][0]["elements"] == [{"tag": "hr", "margin": "0px 0px 0px 0px"}]
+        assert _callback_values(divider) == []
+    assert form["padding"] == "0px 0px 0px 0px"
+    assert len(form["elements"]) == 1
+    composer = form["elements"][0]["elements"][0]
+    assert composer["tag"] == "interactive_container"
+    assert composer["background_style"] == "codex_canvas"
+    assert composer["padding"] == "16px 20px 18px 20px"
+    assert composer["vertical_spacing"] == "8px"
+    assert composer["behaviors"] == []
+    assert composer["has_border"] is False
+    assert composer["corner_radius"] == "0px"
+    assert composer.get("disabled") is not True
+    assert "confirm" not in composer
+    assert [node["tag"] for node in composer["elements"]] == ["markdown", "input", "button"]
+    _assert_native_paper_edge(card)
 
     inputs = [node for node in _walk_card(form) if node.get("tag") == "input"]
     assert [node["name"] for node in inputs] == ["desktop_command__thread-1"]
@@ -906,7 +1026,7 @@ def test_conversation_card_uses_single_column_copy_and_standard_collapsible_icon
     assert "Workspace" not in rendered
     assert "ASSISTANT / LIVE OUTPUT" not in rendered
     assert "YOU / TASK CONTEXT" not in rendered
-    shell = card["body"]["elements"][0]["elements"]
+    shell = card["body"]["elements"][0]["elements"][0]["elements"]
     user_index = next(
         index for index, node in enumerate(shell)
         if node.get("tag") == "interactive_container"
@@ -920,13 +1040,17 @@ def test_conversation_card_uses_single_column_copy_and_standard_collapsible_icon
     assert user_index < codex_index
     assert [node["tag"] for node in card["body"]["elements"]] == [
         "interactive_container",
-        "hr",
-        "form",
-        "hr",
         "interactive_container",
+        "form",
+        "interactive_container",
+        "interactive_container",
+        "column_set",
     ]
-    assert card["body"]["elements"][-1]["corner_radius"] == "12px"
-    assert card["body"]["elements"][-1]["border_color"] == "codex_secondary"
+    secondary_paper = card["body"]["elements"][-2]["elements"][0]
+    assert secondary_paper["corner_radius"] == "0px"
+    assert secondary_paper["has_border"] is False
+    assert "border_color" not in secondary_paper
+    _assert_native_paper_edge(card)
     bordered_surfaces = [
         node for node in _walk_card(card)
         if node.get("tag") == "interactive_container"
@@ -968,10 +1092,22 @@ def test_all_desktop_builders_use_workspace_foundation_and_final_palette():
         assert card["config"]["update_multi"] is True
         assert 8 <= len(card["config"]["summary"]["content"]) <= 60
         assert card["body"]["padding"] == "0px 0px 0px 0px"
-        assert card["body"]["elements"][0]["background_style"] == "codex_canvas"
+        paper = card["body"]["elements"][0]["elements"][0]
+        assert paper["background_style"] == "codex_canvas"
+        assert paper["corner_radius"] == "0px"
+        assert paper["has_border"] is False
+        assert "border_color" not in paper
+        _assert_native_paper_edge(card)
         colors = card["config"]["style"]["color"]
         assert colors == soft_color_tokens()
-        assert colors["codex_canvas"]["light_mode"] == "rgba(250,251,252,1)"
+        assert colors["codex_canvas"] == {
+            "light_mode": "rgba(241,243,245,1)",
+            "dark_mode": "rgba(38,43,49,1)",
+        }
+        assert colors["codex_paper_edge"] == {
+            "light_mode": "rgba(225,229,233,1)",
+            "dark_mode": "rgba(38,43,49,1)",
+        }
         assert colors["codex_accent"]["light_mode"] == "rgba(237,243,239,1)"
         assert colors["codex_accent_2"]["light_mode"] == "rgba(234,240,245,1)"
         assert colors["codex_button"] == {
@@ -989,6 +1125,21 @@ def test_all_desktop_builders_use_workspace_foundation_and_final_palette():
             node.get("tag") == "button" and node.get("type", "").startswith("primary")
             for node in _walk_card(card)
         )
+
+
+@pytest.mark.parametrize("kind", ["unbound", "empty_list", "empty_archive", "completion_without_session"])
+def test_paper_edge_does_not_add_interactions_to_empty_or_unbound_cards(kind):
+    if kind == "unbound":
+        card = build_desktop_card(None)
+    elif kind == "completion_without_session":
+        card = build_desktop_completion_card({"title": "没有 Session ID 的任务"})
+    else:
+        card = build_desktop_list_card([], archived=kind == "empty_archive")
+
+    _assert_native_paper_edge(card)
+    assert not any(node.get("tag") == "form" for node in _walk_card(card))
+    assert _callback_values(card, "desktop_attach") == []
+    assert _callback_values(card, "desktop_interrupt") == []
 
 
 def test_pending_interrupt_precedes_conversation_and_history_is_read_only():
@@ -1010,10 +1161,17 @@ def test_pending_interrupt_precedes_conversation_and_history_is_read_only():
     }]
     normalized = normalize_conversation_state(snapshot, retain_raw=False)
 
-    live = json.dumps(build_desktop_card(normalized), ensure_ascii=False)
+    live_card = build_desktop_card(normalized)
+    _assert_native_paper_edge(live_card)
+    live = json.dumps(live_card, ensure_ascii=False)
     assert live.index("命令执行审批") < live.index("正在检查项目结构")
 
     historical_card = build_desktop_card(normalized, selected_turn_id="turn-history")
+    _assert_native_paper_edge(historical_card)
+    historical_forms = [node for node in historical_card["body"]["elements"] if node.get("tag") == "form"]
+    assert len(historical_forms) == 1
+    assert historical_forms[0]["name"] == "desktop_input"
+    assert historical_forms[0]["elements"][0]["elements"][0]["background_style"] == "codex_canvas"
     _assert_status_badge(historical_card, "已完成", "success")
     historical = json.dumps(historical_card, ensure_ascii=False)
     assert "历史第 1/2 轮" in historical
