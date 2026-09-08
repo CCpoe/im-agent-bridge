@@ -7,9 +7,10 @@ import pytest
 from lark_client.card_theme import soft_color_tokens, status_color_tokens, status_tone
 
 
-# 与确认预览一致；不从实现常量反向生成期望值。
+# 固定选定的 B 冷雾灰纸面并保留已确认状态/操作色；不从实现常量反推期望值。
 _APPROVED_HEX_PAIRS = {
-    "codex_canvas": ("FAFBFC", "262B31"),
+    "codex_canvas": ("F1F3F5", "262B31"),
+    "codex_paper_edge": ("E1E5E9", "262B31"),
     "codex_body": ("FFFFFF", "2C3239"),
     "codex_panel": ("FFFFFF", "2C3239"),
     "codex_secondary": ("DDE4EA", "454F59"),
@@ -80,6 +81,27 @@ def test_soft_palette_returns_independent_nested_tokens():
     assert "unexpected" not in second
     assert second["codex_button"]["light_mode"] == "rgba(229,237,243,1)"
     assert first["codex_panel"]["dark_mode"] == "rgba(44,50,57,1)"
+
+
+def test_paper_surface_uses_selected_cool_gray_and_keeps_dark_and_semantic_colors():
+    colors = soft_color_tokens()
+    assert colors["codex_canvas"] == {
+        "light_mode": "rgba(241,243,245,1)",
+        "dark_mode": "rgba(38,43,49,1)",
+    }
+    assert colors["codex_paper_edge"] == {
+        "light_mode": "rgba(225,229,233,1)",
+        "dark_mode": "rgba(38,43,49,1)",
+    }
+    assert colors["codex_paper_edge"]["dark_mode"] == colors["codex_canvas"]["dark_mode"]
+    assert (
+        _luminance(colors["codex_paper_edge"]["light_mode"])
+        < _luminance(colors["codex_canvas"]["light_mode"])
+        < _luminance(colors["codex_body"]["light_mode"])
+    )
+    for name, (light, dark) in _APPROVED_HEX_PAIRS.items():
+        if name.startswith(("codex_status_", "codex_button")):
+            assert colors[name] == {"light_mode": _rgba(light), "dark_mode": _rgba(dark)}
 
 
 @pytest.mark.parametrize(("status", "tone"), [
